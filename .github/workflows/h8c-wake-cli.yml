@@ -1,0 +1,54 @@
+# 自用 fork 的 wake-cli:推 h8c-* tag 触发,三端原生 runner 上跑 wake-core 的测试,
+# 编一个 wake-cli,连同 sha256 传到同名 Release。只有 wake-cli,不打 GUI 包;
+# v* tag 归 release.yml,这里不碰。
+name: wake-cli for h8c
+
+on:
+  push:
+    tags: ['h8c-*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: wake-cli (${{ matrix.asset }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, asset: wake-cli-linux-amd64, bin: wake-cli }
+          - { os: macos-15, asset: wake-cli-macos-arm64, bin: wake-cli }
+          - { os: windows-2022, asset: wake-cli-windows-amd64.exe, bin: wake-cli.exe }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test -p wake-core
+
+      - name: Build
+        env:
+          WAKE_BUILD_MARK: +${{ github.ref_name }}
+        run: cargo build --release -p wake-core --bin wake-cli
+
+      - name: Show version
+        shell: bash
+        run: target/release/${{ matrix.bin }} --version
+
+      - name: Upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cp "target/release/${{ matrix.bin }}" "${{ matrix.asset }}"
+          sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256" || shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --prerelease --notes "wake-cli built from this fork for h8c." --target "$GITHUB_SHA" || true
+          gh release upload "$TAG" "${{ matrix.asset }}" "${{ matrix.asset }}.sha256" --clobber

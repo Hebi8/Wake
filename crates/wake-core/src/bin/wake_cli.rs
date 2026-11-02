@@ -53,7 +53,12 @@ fn main() -> ExitCode {
     };
     match inv.action {
         Action::Help => write(ok(cli::help())),
-        Action::Version => write(ok(format!("wake-cli {}", mcp::SERVER_VERSION))),
+        Action::Version => write(ok(format!(
+            "wake-cli {}{}",
+            mcp::SERVER_VERSION,
+            // 自用 fork 的构建打上标记,与同版本的正式发行区分开(见 h8c-wake-cli.yml)
+            option_env!("WAKE_BUILD_MARK").unwrap_or("")
+        ))),
         Action::Setup => write(ok(setup(&inv.db))),
         Action::Index => write(index(&db_path(&inv.db))),
         Action::Refresh => write(refresh(&db_path(&inv.db))),
