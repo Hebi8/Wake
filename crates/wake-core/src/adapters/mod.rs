@@ -753,10 +753,7 @@ impl ParsedSession {
                 tool_calls: m.tool_calls.clone(),
                 thinking: m.thinking.clone(),
                 model: m.model.clone(),
-                full_text: m
-                    .full_text
-                    .clone()
-                    .or_else(|| (m.text.len() > MAX_MSG_TEXT).then(|| m.text.clone())),
+                full_text: m.full_text.clone(),
             })
             .collect();
         Self {

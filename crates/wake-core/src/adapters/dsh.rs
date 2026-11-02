@@ -601,6 +601,18 @@ fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
     if let Some(cut) = p.inherited {
         collapse_inherited(&mut p.messages, cut, "session");
     }
+    // 后台续跑的子代理:派它的调用只回一句 `started subagent <子会话 id>`(dsh-tool-subagent
+    // 的约定;本地跑的子代理 id 就是它的会话 id)。前台跑的结果只有最终文字,不带 id,挂不上
+    for call in p.messages.iter_mut().flat_map(|m| m.tool_calls.iter_mut()) {
+        let child = call
+            .output
+            .as_deref()
+            .and_then(|out| out.trim().strip_prefix("started subagent "))
+            .filter(|id| !id.is_empty() && !id.contains(char::is_whitespace));
+        if let Some(id) = child {
+            call.child_id = Some(id.to_string());
+        }
+    }
     assign_seq(&mut p.messages);
     Ok(p)
 }
@@ -732,19 +744,7 @@ impl AgentAdapter for DshAdapter {
     fn parse_transcript(&self, r: &SessionFileRef) -> Result<ParsedTranscript> {
         let mut parsed = parse_dsh_log(Path::new(&r.file_path), true)?;
         let meta = build_meta(r, &parsed);
-        let mut mainline = std::mem::take(&mut parsed.messages);
-        // 后台续跑的子代理:派它的调用只回一句 `started subagent <子会话 id>`(dsh-tool-subagent
-        // 的约定;本地跑的子代理 id 就是它的会话 id)。前台跑的结果只有最终文字,不带 id,挂不上
-        for call in mainline.iter_mut().flat_map(|m| m.tool_calls.iter_mut()) {
-            let child = call
-                .output
-                .as_deref()
-                .and_then(|out| out.trim().strip_prefix("started subagent "))
-                .filter(|id| !id.is_empty() && !id.contains(char::is_whitespace));
-            if let Some(id) = child {
-                call.child_id = Some(id.to_string());
-            }
-        }
+        let mainline = std::mem::take(&mut parsed.messages);
         Ok(ParsedTranscript {
             meta,
             mainline,

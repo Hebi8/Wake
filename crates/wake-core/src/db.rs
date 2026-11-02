@@ -104,6 +104,16 @@ CREATE TABLE IF NOT EXISTS structure_sessions (
   format TEXT NOT NULL
 );
 
+-- Failed structure-only repairs wait for a source or parser change.
+CREATE TABLE IF NOT EXISTS structure_failures (
+  session_key TEXT PRIMARY KEY,
+  file_path TEXT NOT NULL,
+  file_mtime INTEGER NOT NULL,
+  file_size INTEGER NOT NULL,
+  fts_format TEXT NOT NULL,
+  format TEXT NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
   text,
   content='messages', content_rowid='id',
@@ -1904,12 +1914,44 @@ impl Store {
              DELETE FROM schema_meta WHERE key = 'cjk_backfill';
              DELETE FROM memories; DELETE FROM memories_fts; DELETE FROM wake_lookups;
              DELETE FROM tool_calls; DELETE FROM message_extras; DELETE FROM structure_sessions;
+             DELETE FROM structure_failures;
              DELETE FROM sessions;",
         )?;
         Ok(())
     }
 
     // ---------- 读路径(UI 查询) ----------
+
+    /// Stock writers leave structure untouched. Check stamps without reading messages.
+    pub fn stale_structure_keys(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = self.read.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT s.key FROM sessions s
+             LEFT JOIN structure_sessions st ON st.session_key = s.key
+             LEFT JOIN structure_failures f ON f.session_key = s.key
+               AND f.file_path = s.file_path AND f.file_mtime = s.file_mtime
+               AND f.file_size = s.file_size AND f.fts_format = ?1 AND f.format = ?2
+             WHERE s.file_mtime > 0 AND f.session_key IS NULL AND
+               (st.session_key IS NULL OR st.file_mtime != s.file_mtime
+                OR st.file_size != s.file_size OR st.fts_format != ?1 OR st.format != ?2)",
+        )?;
+        let rows = stmt.query_map(params![FTS_FORMAT, STRUCTURE_FORMAT], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Only suppress a repair of the exact indexed source that failed. A changed file,
+    /// explicit full scan, or format upgrade retries; successful writes clear the entry.
+    pub fn record_structure_failure(&self, path: &str, mtime: i64, size: i64) -> Result<()> {
+        let conn = self.write.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO structure_failures
+               (session_key, file_path, file_mtime, file_size, fts_format, format)
+             SELECT key, file_path, file_mtime, file_size, ?4, ?5 FROM sessions
+             WHERE file_path = ?1 AND file_mtime = ?2 AND file_size = ?3 AND file_mtime > 0",
+            params![path, mtime, size, FTS_FORMAT, STRUCTURE_FORMAT],
+        )?;
+        Ok(())
+    }
 
     pub fn known_files(&self) -> Result<HashMap<String, (i64, i64, String)>> {
         let conn = self.read.lock().unwrap();
@@ -3785,7 +3827,12 @@ fn write_session_tx(
 }
 
 fn clear_structure(tx: &rusqlite::Transaction<'_>, key: &str) -> Result<()> {
-    for table in ["tool_calls", "message_extras", "structure_sessions"] {
+    for table in [
+        "tool_calls",
+        "message_extras",
+        "structure_sessions",
+        "structure_failures",
+    ] {
         tx.prepare_cached(&format!("DELETE FROM {table} WHERE session_key = ?1"))?
             .execute(params![key])?;
     }

@@ -449,7 +449,9 @@ fn run_scan_inner(
     // 跑完就清旗子,不按"全部成功"重试——解析失败的文件下次也不会自己好,它变了
     // 自然走增量重解析;留着旗子只会让每次启动都全量一遍
     let force_structure = store.needs_structure_reindex();
-    let force_reindex = store.needs_fts_reindex() || force_structure;
+    let force_fts = store.needs_fts_reindex();
+    let force_reindex = force_fts || force_structure;
+    let stale_structure = store.stale_structure_keys()?;
     let known = store.known_files()?;
     let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     struct WorkItem<'a> {
@@ -573,7 +575,12 @@ fn run_scan_inner(
                     // 墓碑要按**这个最终 key** 再卡——write_meta_only 是第三条
                     // 写库路径,漏了它,已删会话会以空正文卡片复活
                     //(2026-08-24 Codex review P1)
-                    if (changed || full || force_adapter) && !store.is_key_tombstoned(&meta.key) {
+                    if (changed
+                        || full
+                        || force_fts
+                        || (force_grok_backfill && adapter.agent() == AgentId::Grok))
+                        && !store.is_key_tombstoned(&meta.key)
+                    {
                         // fileMtime=0 → 后续全量解析仍会执行
                         Some((meta.clone(), 0))
                     } else {
@@ -591,7 +598,9 @@ fn run_scan_inner(
             let changed = owner_changed.contains(&r.file_path)
                 || match known.get(&r.file_path) {
                     None => true,
-                    Some((mtime, size, _)) => *mtime != r.mtime_ms || *size != r.size,
+                    Some((mtime, size, key)) => {
+                        *mtime != r.mtime_ms || *size != r.size || stale_structure.contains(key)
+                    }
                 };
             if full || force_adapter || changed {
                 let quick = quick_map
@@ -638,8 +647,10 @@ fn run_scan_inner(
     for item in &queue {
         let forced_grok = force_grok_backfill && item.adapter.agent() == AgentId::Grok;
         let mut item_written = false;
+        let mut parsed_any = false;
         match item.adapter.parse_session(&item.r) {
             Ok(parsed) => {
+                parsed_any = true;
                 // quick/parsed 合并策略属各 adapter(默认 parsed 为准 quick 补缺,
                 // Codex 覆写 title/key 优先级),scanner 不再内嵌任何 agent 特例
                 let meta = match &item.quick {
@@ -678,6 +689,7 @@ fn run_scan_inner(
                     let fb_adapter = &adapters[*fb_ix];
                     match fb_adapter.parse_session(fb) {
                         Ok(parsed) => {
+                            parsed_any = true;
                             let quick = fb_adapter.quick_meta(std::slice::from_ref(fb));
                             let meta = match quick.as_ref().and_then(|m| m.get(&fb.file_path)) {
                                 Some(q) => fb_adapter.merge_quick_meta(parsed.meta, q),
@@ -716,6 +728,14 @@ fn run_scan_inner(
                 }
             }
         }
+        if !parsed_any
+            && (force_structure
+                || known
+                    .get(&item.r.file_path)
+                    .is_some_and(|(_, _, key)| stale_structure.contains(key)))
+        {
+            store.record_structure_failure(&item.r.file_path, item.r.mtime_ms, item.r.size)?;
+        }
         if forced_grok && !item_written {
             grok_backfill_succeeded = false;
         }
@@ -736,9 +756,10 @@ fn run_scan_inner(
     if force_grok_backfill && grok_backfill_succeeded {
         store.finish_grok_parent_backfill()?;
     }
-    if force_reindex {
+    if force_fts {
         store.finish_fts_reindex()?;
     }
+    // Frozen adapters retain stale stamps and are repaired when enumeration recovers.
     if force_structure {
         store.finish_structure_reindex()?;
     }

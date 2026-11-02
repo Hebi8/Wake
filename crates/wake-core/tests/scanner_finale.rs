@@ -763,6 +763,162 @@ fn structure_reindex_flag_reprocesses_unchanged_rows_once() {
     assert_eq!(title(&store), "after");
 }
 
+/// A stock writer updates the main row but leaves missing or older side stamps.
+#[test]
+fn structure_repairs_stock_writes_and_skips_current_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let path = "/tmp/structure-repair/s.jsonl";
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(seed(
+        AgentId::ClaudeCode,
+        "/tmp/structure-repair",
+        path,
+        "s",
+        42,
+    ))];
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("scan.db")).unwrap();
+    for sql in [
+        "DELETE FROM structure_sessions",
+        "UPDATE structure_sessions SET file_mtime = 1",
+        "UPDATE structure_sessions SET file_size = file_size + 1",
+        "UPDATE structure_sessions SET fts_format = 'old'",
+        "UPDATE structure_sessions SET format = 'old'",
+    ] {
+        conn.execute(sql, []).unwrap();
+        assert!(store
+            .stale_structure_keys()
+            .unwrap()
+            .contains("claude-code:s"));
+        let rec = Recorder::new();
+        run_scan(&adapters, &store, &rec, false).unwrap();
+        assert_eq!(rec.0.lock().unwrap().last().unwrap().total, 1);
+        assert!(store.stale_structure_keys().unwrap().is_empty());
+        let rec = Recorder::new();
+        run_scan(&adapters, &store, &rec, false).unwrap();
+        assert_eq!(rec.0.lock().unwrap().last().unwrap().total, 0);
+    }
+    // An incomplete quick-meta card is not a successful stock parse.
+    conn.execute("DELETE FROM structure_sessions", []).unwrap();
+    conn.execute("UPDATE sessions SET file_mtime = 0", [])
+        .unwrap();
+    assert!(store.stale_structure_keys().unwrap().is_empty());
+}
+
+#[test]
+fn structure_backfill_recovers_frozen_adapter_without_repeating_healthy_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let path = "/tmp/structure-frozen/s.jsonl";
+    let healthy = || {
+        seed(
+            AgentId::ClaudeCode,
+            "/tmp/structure-healthy",
+            "/tmp/structure-healthy/h.jsonl",
+            "h",
+            42,
+        )
+    };
+    let frozen = || seed(AgentId::ClaudeCode, "/tmp/structure-frozen", path, "s", 42);
+    let conn = rusqlite::Connection::open(dir.path().join("scan.db")).unwrap();
+    store
+        .write_meta_only(&[(frozen().meta, 42), (healthy().meta, 42)])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO schema_meta VALUES ('structure_reindex', '1')",
+        [],
+    )
+    .unwrap();
+    let mut broken = frozen();
+    broken.fail_list = true;
+    run_scan(
+        &[Box::new(broken), Box::new(healthy())],
+        &store,
+        &Recorder::new(),
+        false,
+    )
+    .unwrap();
+    assert!(!store.needs_structure_reindex());
+    assert!(store
+        .stale_structure_keys()
+        .unwrap()
+        .contains("claude-code:s"));
+    let rec = Recorder::new();
+    run_scan(
+        &[Box::new(frozen()), Box::new(healthy())],
+        &store,
+        &rec,
+        false,
+    )
+    .unwrap();
+    assert_eq!(rec.0.lock().unwrap().last().unwrap().total, 1);
+    assert!(store.stale_structure_keys().unwrap().is_empty());
+}
+
+#[test]
+fn failed_structure_repair_waits_for_a_change_even_across_refresh_processes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("scan.db");
+    let path = "/tmp/structure-failure/s.jsonl";
+    let source = || seed(AgentId::ClaudeCode, "/tmp/structure-failure", path, "s", 42);
+    let store = temp_store(dir.path());
+    store.write_meta_only(&[(source().meta, 42)]).unwrap();
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "INSERT INTO schema_meta VALUES ('structure_reindex', '1')",
+            [],
+        )
+        .unwrap();
+    let mut broken = source();
+    broken.fail_parse = true;
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(broken)];
+    let rec = Recorder::new();
+    run_scan(&adapters, &store, &rec, false).unwrap();
+    assert_eq!(rec.0.lock().unwrap().last().unwrap().total, 1);
+    drop(store);
+    let store = Arc::new(Store::open(&db).unwrap());
+    for _ in 0..3 {
+        let rec = Recorder::new();
+        run_scan(&adapters, &store, &rec, false).unwrap();
+        assert_eq!(rec.0.lock().unwrap().last().unwrap().total, 0);
+    }
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM structure_sessions", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    // A parser/format change makes the failed attempt obsolete.
+    conn.execute("UPDATE structure_failures SET format = 'old'", [])
+        .unwrap();
+    assert!(store
+        .stale_structure_keys()
+        .unwrap()
+        .contains("claude-code:s"));
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    // Explicit full scans remain a manual retry even for unchanged failed sources.
+    let rec = Recorder::new();
+    run_scan(&[Box::new(source())], &store, &rec, true).unwrap();
+    assert_eq!(rec.0.lock().unwrap().last().unwrap().total, 1);
+    conn.execute("DELETE FROM structure_sessions", []).unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    // A changed source is retried normally, and a successful write clears the failure.
+    let mut changed = source();
+    changed.r.mtime_ms += 1;
+    let rec = Recorder::new();
+    run_scan(&[Box::new(changed)], &store, &rec, false).unwrap();
+    assert_eq!(rec.0.lock().unwrap().last().unwrap().total, 1);
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM structure_failures", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(store.stale_structure_keys().unwrap().is_empty());
+}
+
 #[test]
 fn format_two_backfills_pi_tokens_without_source_changes() {
     use wake_core::adapters::pi::PiAdapter;

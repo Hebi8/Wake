@@ -774,6 +774,7 @@ fn cursor_subagents_become_child_sessions() {
     let child = adapter.parse_session(&sub_ref).unwrap().meta;
     let parent_ref = listed.iter().find(|r| r.native_id == parent).unwrap();
     let parent_meta = adapter.parse_session(parent_ref).unwrap().meta;
+    assert_seq_contract(adapter.as_ref(), parent_ref);
     assert_eq!(child.key, format!("cursor:{sub}"));
     assert!(child.spawned && !parent_meta.spawned);
     assert_eq!(
@@ -1299,6 +1300,7 @@ fn codex_spawned_subagent_keeps_only_its_own_turns() {
     assert!(parsed.meta.spawned);
     let parent = refs.iter().find(|r| r.native_id == parent_id).unwrap();
     assert!(!adapter.parse_session(parent).unwrap().meta.spawned);
+    assert_seq_contract(adapter.as_ref(), parent);
 
     let transcript = adapter.parse_transcript(child).unwrap();
     let visible: Vec<&TranscriptMessage> = transcript
@@ -1841,6 +1843,7 @@ fn qoder_parse_contract() {
         )]
     );
     assert_seq_contract(rooted.as_ref(), &sub_ref);
+    assert_seq_contract(rooted.as_ref(), &r);
 }
 
 #[test]
@@ -3024,6 +3027,7 @@ fn kimi_subagents_become_child_sessions() {
     assert!(!resumable(&adapter, &child), "子代理不是能单独恢复的会话");
 
     let main_ref = refs.iter().find(|r| r.native_id == session_id).unwrap();
+    assert_seq_contract(adapter.as_ref(), main_ref);
     let t = adapter.parse_transcript(main_ref).unwrap();
     let call = t
         .mainline
@@ -3890,6 +3894,7 @@ fn dsh_background_subagent_calls_open_the_child_session() {
     let adapter = DshAdapter::new().with_custom_root(tmp.path().to_path_buf());
     let refs = adapter.list_session_files().unwrap();
     assert_eq!(refs.len(), 1);
+    assert_seq_contract(adapter.as_ref(), &refs[0]);
     let calls: Vec<(String, Option<String>)> = adapter
         .parse_transcript(&refs[0])
         .unwrap()
@@ -7503,6 +7508,7 @@ fn codebuddy_lists_transcripts_and_their_subagents() {
     );
     assert_seq_contract(adapter.as_ref(), &sub_ref);
     assert_eq!(adapter.session_paths(&child), [sub_ref.file_path.clone()]);
+    assert_seq_contract(adapter.as_ref(), &main_ref);
     let t = adapter.parse_transcript(&main_ref).unwrap();
     let ids: Vec<(&str, Option<&str>)> = t
         .sidechains
