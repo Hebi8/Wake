@@ -19,13 +19,16 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-24.04, asset: wake-cli-linux-amd64, bin: wake-cli }
-          - { os: macos-15, asset: wake-cli-macos-arm64, bin: wake-cli }
+          # macos-15(arm64)常年排不上队:在 Intel runner 上测试,交叉编 arm64
+          - { os: macos-15-intel, asset: wake-cli-macos-arm64, bin: wake-cli, target: aarch64-apple-darwin }
           - { os: windows-2022, asset: wake-cli-windows-amd64.exe, bin: wake-cli.exe }
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -34,13 +37,24 @@ jobs:
         run: cargo test -p wake-core
 
       - name: Build
+        shell: bash
         env:
           WAKE_BUILD_MARK: +${{ github.ref_name }}
-        run: cargo build --release -p wake-core --bin wake-cli
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --release -p wake-core --bin wake-cli ${TARGET:+--target "$TARGET"}
+          cp "target/${TARGET:+$TARGET/}release/${{ matrix.bin }}" "${{ matrix.asset }}"
 
       - name: Show version
+        if: ${{ !matrix.target }}
         shell: bash
-        run: target/release/${{ matrix.bin }} --version
+        run: ./${{ matrix.asset }} --version
+
+      - name: Show architecture and signature
+        if: runner.os == 'macOS'
+        run: |
+          file "${{ matrix.asset }}"
+          codesign -dv "${{ matrix.asset }}"
 
       - name: Upload
         shell: bash
@@ -48,7 +62,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          cp "target/release/${{ matrix.bin }}" "${{ matrix.asset }}"
           sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256" || shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --prerelease --notes "wake-cli built from this fork for h8c." --target "$GITHUB_SHA" || true
           gh release upload "$TAG" "${{ matrix.asset }}" "${{ matrix.asset }}.sha256" --clobber
