@@ -1844,6 +1844,11 @@ fn qoder_parse_contract() {
     );
     assert_seq_contract(rooted.as_ref(), &sub_ref);
     assert_seq_contract(rooted.as_ref(), &r);
+    assert_eq!(
+        dispatched_children(rooted.as_ref(), &r),
+        ["agent-child"],
+        "索引侧的派活调用指向子会话"
+    );
 }
 
 #[test]
@@ -3480,6 +3485,18 @@ fn antigravity_transcripts_replace_index_cards() {
 }
 
 // ---------------------------------------------------------------- seq 契约
+
+/// `parse_session` 写进侧表的调用里,指向子会话的那些 `child_id`
+fn dispatched_children(adapter: &dyn AgentAdapter, r: &SessionFileRef) -> Vec<String> {
+    adapter
+        .parse_session(r)
+        .unwrap()
+        .structure
+        .iter()
+        .flat_map(|row| &row.tool_calls)
+        .filter_map(|call| call.child_id.clone())
+        .collect()
+}
 
 /// 跨文件不变量 1:FTS 单元的 seq 必须能在详情页 mainline 中找到同号消息,
 /// 且 mainline seq 从 0 严格递增(搜索跳转按 seq 定位依赖此契约)。
@@ -7431,9 +7448,10 @@ fn codebuddy_parse_contract() {
     assert!(!first.tool_calls[0].is_error);
 
     let second = &t.mainline[2];
-    assert_eq!(second.tool_calls.len(), 1);
+    assert_eq!(second.tool_calls.len(), 2);
     assert_eq!(second.tool_calls[0].name, "Bash");
     assert!(second.tool_calls[0].is_error, "status=failed 判错");
+    assert_eq!(second.tool_calls[1].name, "Task");
     assert!(second.text.is_empty());
 
     assert_eq!(
@@ -7507,8 +7525,21 @@ fn codebuddy_lists_transcripts_and_their_subagents() {
         )]
     );
     assert_seq_contract(adapter.as_ref(), &sub_ref);
-    assert_eq!(adapter.session_paths(&child), [sub_ref.file_path.clone()]);
+    assert_eq!(
+        adapter.session_paths(&child),
+        [
+            sub_ref.file_path.clone(),
+            sub.with_extension("meta.json")
+                .to_string_lossy()
+                .to_string()
+        ]
+    );
     assert_seq_contract(adapter.as_ref(), &main_ref);
+    assert_eq!(
+        dispatched_children(adapter.as_ref(), &main_ref),
+        ["agent-deadbeef"],
+        "索引侧的派活调用指向子会话"
+    );
     let t = adapter.parse_transcript(&main_ref).unwrap();
     let ids: Vec<(&str, Option<&str>)> = t
         .sidechains
