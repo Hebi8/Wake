@@ -429,6 +429,7 @@ mod compact_tests {
             role,
             kind,
             text: text.to_string(),
+            full_text: None,
             truncated: false,
             tool_calls: Vec::new(),
             thinking: None,

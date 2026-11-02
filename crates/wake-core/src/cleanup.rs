@@ -1320,6 +1320,7 @@ mod tests {
                 units: vec![],
                 unknown_line_count: u32::from(text == "BAD"),
                 wake_lookups: Vec::new(),
+                structure: Vec::new(),
             })
         }
         fn parse_transcript(&self, r: &SessionFileRef) -> Result<ParsedTranscript> {

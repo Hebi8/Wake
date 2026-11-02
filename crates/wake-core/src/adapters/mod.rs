@@ -743,8 +743,25 @@ impl ParsedSession {
         messages: &[TranscriptMessage],
         unknown_line_count: u32,
     ) -> Self {
+        let units = units_from_messages(messages);
+        let indexed: std::collections::HashSet<_> = units.iter().map(|u| u.seq).collect();
+        let structure = messages
+            .iter()
+            .filter(|m| m.kind == MessageKind::Text && indexed.contains(&m.seq))
+            .map(|m| MessageStructure {
+                seq: m.seq,
+                tool_calls: m.tool_calls.clone(),
+                thinking: m.thinking.clone(),
+                model: m.model.clone(),
+                full_text: m
+                    .full_text
+                    .clone()
+                    .or_else(|| (m.text.len() > MAX_MSG_TEXT).then(|| m.text.clone())),
+            })
+            .collect();
         Self {
-            units: units_from_messages(messages),
+            units,
+            structure,
             wake_lookups: wake_lookups_from_messages(messages),
             meta,
             unknown_line_count,
@@ -1513,6 +1530,7 @@ mod tests {
             kind: MessageKind::Text,
             text: text.to_string(),
             truncated: false,
+            full_text: None,
             tool_calls: tools
                 .iter()
                 .map(|(name, preview)| tc(name, preview, None))

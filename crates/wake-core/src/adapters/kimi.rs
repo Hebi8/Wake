@@ -813,7 +813,10 @@ impl AgentAdapter for KimiAdapter {
     }
 
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
-        let (meta, messages, unknown) = self.parse(r, false)?;
+        let (meta, mut messages, unknown) = self.parse(r, false)?;
+        if let Some(dir) = session_dir_of(Path::new(&r.file_path)) {
+            link_agent_calls(dir, &mut messages);
+        }
         Ok(ParsedSession::derive(meta, &messages, unknown))
     }
 

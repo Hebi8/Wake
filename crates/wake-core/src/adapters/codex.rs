@@ -31,6 +31,23 @@ pub struct CodexAdapter {
 }
 
 impl CodexAdapter {
+    fn link_spawned(&self, id: &str, mainline: &mut [TranscriptMessage]) {
+        // 有派活的调用才去问 state DB(按库戳缓存,parent_links 同款);读不出就不挂跳转
+        if mainline
+            .iter()
+            .flat_map(|m| &m.tool_calls)
+            .any(|call| call.name == "spawn_agent")
+        {
+            let stamp = super::sqlite_ro::db_cache_stamp(&self.state_db);
+            let spawned = self
+                .spawned_cache
+                .get_or_try_build(stamp, || read_spawned_threads(&self.state_db));
+            if let Some(children) = spawned.as_deref().and_then(|map| map.get(id)) {
+                link_spawned_threads(children, mainline);
+            }
+        }
+    }
+
     pub fn new() -> Self {
         // codex 认 CODEX_HOME(kooky 的 CodexUsageMonitor 同样处理)。
         // 采信前探真会话目录而不是只看根目录在不在——后者会让 CODEX_HOME
@@ -1004,13 +1021,14 @@ fn clean_user_text(text: &str) -> String {
 }
 
 fn mk_msg(role: Role, kind: MessageKind, text: &str, ts: i64) -> TranscriptMessage {
-    let (clipped, truncated) = clip(text, MAX_MSG_TEXT);
+    let (clipped, truncated, full_text) = clip_message(text);
     TranscriptMessage {
         seq: 0,
         role,
         kind,
         text: clipped,
         truncated,
+        full_text,
         tool_calls: Vec::new(),
         thinking: None,
         timestamp: if ts > 0 { Some(ts) } else { None },
@@ -1358,8 +1376,9 @@ impl AgentAdapter for CodexAdapter {
     }
 
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
-        let parsed = parse_rollout(Path::new(&r.file_path), false)?;
+        let mut parsed = parse_rollout(Path::new(&r.file_path), false)?;
         let meta = build_meta(r, &parsed, &self.archived_dir);
+        self.link_spawned(&meta.id, &mut parsed.messages);
         Ok(ParsedSession::derive(
             meta,
             &parsed.messages,
@@ -1371,20 +1390,7 @@ impl AgentAdapter for CodexAdapter {
         let parsed = parse_rollout(Path::new(&r.file_path), true)?;
         let meta = build_meta(r, &parsed, &self.archived_dir);
         let mut mainline = parsed.messages;
-        // 有派活的调用才去问 state DB(按库戳缓存,parent_links 同款);读不出就不挂跳转
-        if mainline
-            .iter()
-            .flat_map(|m| &m.tool_calls)
-            .any(|call| call.name == "spawn_agent")
-        {
-            let stamp = super::sqlite_ro::db_cache_stamp(&self.state_db);
-            let spawned = self
-                .spawned_cache
-                .get_or_try_build(stamp, || read_spawned_threads(&self.state_db));
-            if let Some(children) = spawned.as_deref().and_then(|map| map.get(&meta.id)) {
-                link_spawned_threads(children, &mut mainline);
-            }
-        }
+        self.link_spawned(&meta.id, &mut mainline);
         Ok(ParsedTranscript {
             meta,
             mainline,

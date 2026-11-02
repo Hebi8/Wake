@@ -717,6 +717,53 @@ fn fts_reindex_flag_reprocesses_unchanged_rows_once() {
 }
 
 #[test]
+fn structure_reindex_flag_reprocesses_unchanged_rows_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("reindex.db");
+    {
+        let store = Store::open(&db_path).unwrap();
+        assert!(!store.needs_structure_reindex(), "新库不该挂旗子");
+    }
+    // 模拟升级前的库:有 sessions 表,但没记过 structure_format
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute("DELETE FROM schema_meta WHERE key = 'structure_format'", [])
+        .unwrap();
+    let store = Arc::new(Store::open(&db_path).unwrap());
+    assert!(store.needs_structure_reindex(), "旧库首开要挂旗子");
+
+    let path = "/tmp/reindex/p/s.jsonl";
+    let mut before = seed(AgentId::ClaudeCode, "/tmp/reindex", path, "s", 42);
+    before.meta.title = "before".into();
+    // 库里已有同 mtime/size 的行,增量扫描本会跳过
+    store.write_meta_only(&[(before.meta.clone(), 42)]).unwrap();
+    let mut after = seed(AgentId::ClaudeCode, "/tmp/reindex", path, "s", 42);
+    after.meta.title = "after".into();
+    run_scan(
+        &[Box::new(after) as Box<dyn AgentAdapter>],
+        &store,
+        &Recorder::new(),
+        false,
+    )
+    .unwrap();
+    let title = |store: &Store| store.get_session("claude-code:s").unwrap().unwrap().title;
+    assert_eq!(title(&store), "after", "旗子在时未变的文件也要重处理");
+    assert!(!store.needs_structure_reindex(), "跑完一轮就清");
+
+    // 没旗子、文件没变:增量扫描照常跳过
+    let mut third = seed(AgentId::ClaudeCode, "/tmp/reindex", path, "s", 42);
+    third.meta.title = "third".into();
+    run_scan(
+        &[Box::new(third) as Box<dyn AgentAdapter>],
+        &store,
+        &Recorder::new(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(title(&store), "after");
+}
+
+#[test]
 fn format_two_backfills_pi_tokens_without_source_changes() {
     use wake_core::adapters::pi::PiAdapter;
 
@@ -899,6 +946,7 @@ impl AgentAdapter for SeedAdapter {
             units: Vec::new(),
             unknown_line_count: 0,
             wake_lookups: Vec::new(),
+            structure: Vec::new(),
         })
     }
     fn parse_transcript(&self, _: &SessionFileRef) -> Result<ParsedTranscript> {

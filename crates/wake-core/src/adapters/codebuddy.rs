@@ -153,7 +153,7 @@ fn flush_assistant(
     {
         return;
     }
-    let (text, truncated) = clip(text.trim(), MAX_MSG_TEXT);
+    let (text, truncated, full_text) = clip_message(text.trim());
     let thinking = if p.thinking.is_empty() {
         None
     } else {
@@ -171,6 +171,7 @@ fn flush_assistant(
         kind: MessageKind::Text,
         text,
         truncated,
+        full_text,
         tool_calls: p.tool_calls,
         thinking,
         timestamp: p.timestamp,
@@ -448,7 +449,8 @@ impl AgentAdapter for CodebuddyAdapter {
     }
 
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
-        let (meta, parsed) = self.parse(r, false)?;
+        let (meta, mut parsed) = self.parse(r, false)?;
+        link_subagents(&session_dir(r), &mut parsed.messages);
         Ok(ParsedSession::derive(
             meta,
             &parsed.messages,

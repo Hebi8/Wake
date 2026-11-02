@@ -194,9 +194,16 @@ pub fn user_kind(text: &str) -> MessageKind {
     }
 }
 
+/// Preserve the body before clipping, without changing transcript output.
+pub fn clip_message(text: &str) -> (String, bool, Option<String>) {
+    let (clipped, truncated) = clip(text, MAX_MSG_TEXT);
+    let full_text = truncated.then(|| text.to_owned());
+    (clipped, truncated, full_text)
+}
+
 /// 纯文本消息构造(clip + user 注入判定),多家 adapter 共用
 pub fn text_msg(role: Role, text: &str, ts: i64) -> TranscriptMessage {
-    let (clipped, truncated) = clip(text.trim(), MAX_MSG_TEXT);
+    let (clipped, truncated, full_text) = clip_message(text.trim());
     let kind = if role == Role::User {
         user_kind(text)
     } else {
@@ -208,6 +215,7 @@ pub fn text_msg(role: Role, text: &str, ts: i64) -> TranscriptMessage {
         kind,
         text: clipped,
         truncated,
+        full_text,
         tool_calls: Vec::new(),
         thinking: None,
         timestamp: if ts > 0 { Some(ts) } else { None },
@@ -760,7 +768,8 @@ fn append_content_to_message(message: &mut TranscriptMessage, content: ParsedCon
 
 /// 一次模型调用的产出并进最后一条助手消息(最后一条不是助手就先开一条空的),返回它的下标
 /// (登记工具调用用)。整个 agentic 回合并成一条,单行 `text_msg` 的 clip 靠不住:正文合并后
-/// 统一压 MAX_MSG_TEXT(截过之后只收图片),thinking 压 MAX_TOOL_IO、截过就不再拼接——反复
+/// 展示正文统一压 MAX_MSG_TEXT(截过之后只收图片,full_text 继续收正文),
+/// thinking 压 MAX_TOOL_IO、截过就不再拼接——反复
 /// 对已带截断标记的串再 clip,标记前会一次次多出换行。截过的串连标记一起必然长过上限,所以
 /// 守卫是 `<=`:恰好停在上限上的还要再收一次,不然后面的正文悄悄丢掉、连标记都没有。
 /// 最后一条还没有时间时用这一次的
@@ -779,10 +788,19 @@ pub fn merge_into_last_assistant(
         last.timestamp = Some(ts);
     }
     if !content.text.is_empty() || !content.images.is_empty() {
+        if let Some(full) = &mut last.full_text {
+            if !content.text.is_empty() {
+                if !full.is_empty() {
+                    full.push_str("\n\n");
+                }
+                full.push_str(&content.text);
+            }
+        }
         if last.text.len() <= MAX_MSG_TEXT {
             append_content_to_message(last, content);
             if last.text.len() > MAX_MSG_TEXT {
-                last.text = clip(&last.text, MAX_MSG_TEXT).0;
+                last.full_text = Some(std::mem::take(&mut last.text));
+                last.text = clip(last.full_text.as_deref().unwrap(), MAX_MSG_TEXT).0;
                 last.truncated = true;
             }
         } else {
@@ -1633,11 +1651,22 @@ mod tests {
         assert_eq!(reply.timestamp, Some(2), "还没有时间的用第一次带时间的");
         assert!(reply.truncated);
         assert_eq!(reply.text.matches("(truncated)").count(), 1);
+        assert_eq!(
+            reply.full_text.as_deref(),
+            Some(format!("{big}\n\n{big}").as_str())
+        );
+        let clipped = reply.text.clone();
         let thinking = reply.thinking.clone().unwrap();
         assert!(thinking.starts_with("plan\n\n"));
         assert_eq!(thinking.matches("(truncated)").count(), 1);
         // 到上限后不再拼接,也不再反复 clip
-        merge_into_last_assistant(&mut messages, 4, content(""), "more");
+        merge_into_last_assistant(&mut messages, 4, content("later body"), "more");
+        assert_eq!(messages[1].text, clipped);
+        assert!(messages[1]
+            .full_text
+            .as_ref()
+            .unwrap()
+            .ends_with("\n\nlater body"));
         assert_eq!(messages[1].thinking.as_deref(), Some(thinking.as_str()));
     }
 

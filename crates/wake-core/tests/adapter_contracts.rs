@@ -3508,6 +3508,24 @@ fn assert_seq_contract(adapter: &dyn AgentAdapter, r: &SessionFileRef) {
         assert_eq!(m.role, u.role, "[{tag}] seq {} 两侧角色不一致", u.seq);
     }
 
+    assert_eq!(
+        s.structure.len(),
+        s.units.len(),
+        "[{tag}] structure follows indexed rows"
+    );
+    for structure in &s.structure {
+        let message = &t.mainline[structure.seq as usize];
+        assert_eq!(message.kind, MessageKind::Text);
+        assert_eq!(
+            serde_json::to_value(&structure.tool_calls).unwrap(),
+            serde_json::to_value(&message.tool_calls).unwrap(),
+            "[{tag}] calls match transcript"
+        );
+        assert_eq!(structure.thinking, message.thinking);
+        assert_eq!(structure.model, message.model);
+        assert_eq!(structure.full_text, message.full_text);
+    }
+
     // 两条解析路径共用核心解析器,meta 关键字段必须一致
     assert_eq!(s.meta.key, t.meta.key, "[{tag}] key 两侧不一致");
     assert_eq!(s.meta.title, t.meta.title, "[{tag}] title 两侧不一致");

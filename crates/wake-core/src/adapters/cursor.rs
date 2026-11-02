@@ -226,13 +226,14 @@ fn flush_assistant(pending: &mut Option<PendingAssistant>, messages: &mut Vec<Tr
     if text.is_empty() && p.tool_calls.is_empty() && images.is_empty() {
         return;
     }
-    let (clipped, truncated) = clip(&text, MAX_MSG_TEXT);
+    let (clipped, truncated, full_text) = clip_message(&text);
     messages.push(TranscriptMessage {
         seq: 0,
         role: Role::Assistant,
         kind: MessageKind::Text,
         text: clipped,
         truncated,
+        full_text,
         tool_calls: p.tool_calls,
         thinking: None,
         timestamp: p.timestamp,
@@ -649,8 +650,9 @@ impl AgentAdapter for CursorAdapter {
     }
 
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
-        let parsed = parse_cursor_jsonl(Path::new(&r.file_path), false)?;
+        let mut parsed = parse_cursor_jsonl(Path::new(&r.file_path), false)?;
         let meta = self.build_meta(r, &parsed);
+        link_dispatches(r, &mut parsed.messages, &parsed.dispatches);
         Ok(ParsedSession::derive(
             meta,
             &parsed.messages,

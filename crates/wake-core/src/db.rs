@@ -73,6 +73,37 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_key);
 
+-- Optional structure, derived from the same messages in the same transaction.
+CREATE TABLE IF NOT EXISTS tool_calls (
+  session_key TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  idx INTEGER NOT NULL,
+  call_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  input TEXT,
+  output TEXT,
+  is_error INTEGER NOT NULL,
+  child_id TEXT,
+  PRIMARY KEY (session_key, seq, idx)
+);
+CREATE TABLE IF NOT EXISTS message_extras (
+  session_key TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  thinking TEXT,
+  model TEXT,
+  full_text TEXT,
+  PRIMARY KEY (session_key, seq)
+);
+CREATE TABLE IF NOT EXISTS structure_sessions (
+  session_key TEXT PRIMARY KEY,
+  file_mtime INTEGER NOT NULL,
+  file_size INTEGER NOT NULL,
+  fts_format TEXT NOT NULL,
+  rows INTEGER NOT NULL,
+  format TEXT NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
   text,
   content='messages', content_rowid='id',
@@ -255,6 +286,9 @@ CREATE TABLE IF NOT EXISTS claimed_sessions (
 ///       main 时还没有这几条,跑过那时构建的库已经戳着它,所以另起一档
 pub const FTS_FORMAT: &str = "19";
 
+/// Side-table schema and derivation version; independent of search formatting.
+pub const STRUCTURE_FORMAT: &str = "1";
+
 /// 正文里中日韩字符的两字组索引(issue #79):trigram 对两个字的词 MATCH 不出东西,而中文最常搜的
 /// 恰恰是两字词。只收有两个以上相连中日韩字符的行,文本是 `cjk_bigrams` 切好、空格隔开的两字组,
 /// rowid = messages.id;只存索引不存内容,删改按 rowid(contentless_delete)。文本里只有中日韩字符与
@@ -347,6 +381,20 @@ fn open_conn(path: &Path) -> Result<Connection> {
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('fts_format', ?1)",
             params![FTS_FORMAT],
         )?;
+    }
+    if read_meta(&conn, "structure_format")?.as_deref() != Some(STRUCTURE_FORMAT) {
+        let tx = conn.transaction()?;
+        if sessions_existed {
+            tx.execute(
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('structure_reindex', '1')",
+                [],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('structure_format', ?1)",
+            params![STRUCTURE_FORMAT],
+        )?;
+        tx.commit()?;
     }
     // 两字组表:库里记的切法版本与 CJK_FORMAT 不一样(老库首开还没有这张表,或换了切法 / 分词器)
     // 就整张表重建,已有的消息由扫描收尾的维护补进去(`Store::backfill_cjk`,cjk_backfill 记补到哪条
@@ -841,7 +889,7 @@ impl Store {
         let tx = conn.transaction()?;
         // 不经裁决的直写只有测试在用(生产路径全走 write_session_guarded),
         // 不带 Wake 调用记录
-        write_session_tx(&tx, meta, file_mtime, units, &[])?;
+        write_session_tx(&tx, meta, file_mtime, units, &[], &[])?;
         tx.commit()?;
         Ok(())
     }
@@ -859,12 +907,14 @@ impl Store {
     /// 同一事务,先查再删再写会让并发写入的第三份副本被误删;单凭 file_mtime=0
     /// 推断占位也不行,真实文件同样可能给 0(Codex review 二、三、四轮)。
     /// 返回 false = 本次是败方副本,一字未写
+    #[allow(clippy::too_many_arguments)]
     pub fn write_session_guarded(
         &self,
         meta: &SessionMeta,
         file_mtime: i64,
         units: &[IndexUnit],
         lookups: &[WakeLookup],
+        structure: &[MessageStructure],
         rank_of: &dyn Fn(&str) -> u8,
         supersedes: Option<(&str, i64)>,
     ) -> Result<bool> {
@@ -900,7 +950,7 @@ impl Store {
                 }
             }
         }
-        write_session_tx(&tx, meta, file_mtime, units, lookups)?;
+        write_session_tx(&tx, meta, file_mtime, units, lookups, structure)?;
         tx.commit()?;
         Ok(true)
     }
@@ -993,6 +1043,15 @@ impl Store {
 
     pub fn finish_fts_reindex(&self) -> Result<()> {
         self.clear_meta_flag("fts_reindex")
+    }
+
+    /// Reuse the scanner's one-time reparse for side-table upgrades without changing FTS.
+    pub fn needs_structure_reindex(&self) -> bool {
+        self.has_meta_flag("structure_reindex")
+    }
+
+    pub fn finish_structure_reindex(&self) -> Result<()> {
+        self.clear_meta_flag("structure_reindex")
     }
 
     /// 该不该做一次 FTS 压缩(节奏见 `FTS_COMPACT_EVERY_MS`)。读不出记录按到期算——
@@ -1844,6 +1903,7 @@ impl Store {
              INSERT INTO messages_cjk(messages_cjk) VALUES ('delete-all');
              DELETE FROM schema_meta WHERE key = 'cjk_backfill';
              DELETE FROM memories; DELETE FROM memories_fts; DELETE FROM wake_lookups;
+             DELETE FROM tool_calls; DELETE FROM message_extras; DELETE FROM structure_sessions;
              DELETE FROM sessions;",
         )?;
         Ok(())
@@ -3591,6 +3651,7 @@ fn tally_wake_lookups(conn: &Connection, since_ms: i64) -> Result<Vec<LookupTall
 /// (quick 路径也要改标题)。再加一张派生表只改这里和写入侧
 fn clear_session_rows(tx: &rusqlite::Transaction<'_>, key: &str) -> Result<()> {
     replace_units(tx, key, &[])?;
+    clear_structure(tx, key)?;
     tx.prepare_cached("DELETE FROM wake_lookups WHERE session_key = ?1")?
         .execute(params![key])?;
     Ok(())
@@ -3696,9 +3757,11 @@ fn write_session_tx(
     file_mtime: i64,
     units: &[IndexUnit],
     lookups: &[WakeLookup],
+    structure: &[MessageStructure],
 ) -> Result<()> {
     upsert_session(tx, meta, file_mtime)?;
     replace_units(tx, &meta.key, units)?;
+    replace_structure(tx, meta, file_mtime, units.len(), structure)?;
     // Wake 调用记录与 messages 同事务、同 key 删插(行数很少,整份重写);quick 路径
     // (write_meta_only)不经这里,所以不会把记录冲掉。绝大多数会话一次都没有,别为它
     // 白取一次插入语句
@@ -3718,6 +3781,56 @@ fn write_session_tx(
             ])?;
         }
     }
+    Ok(())
+}
+
+fn clear_structure(tx: &rusqlite::Transaction<'_>, key: &str) -> Result<()> {
+    for table in ["tool_calls", "message_extras", "structure_sessions"] {
+        tx.prepare_cached(&format!("DELETE FROM {table} WHERE session_key = ?1"))?
+            .execute(params![key])?;
+    }
+    Ok(())
+}
+
+fn replace_structure(
+    tx: &rusqlite::Transaction<'_>,
+    meta: &SessionMeta,
+    file_mtime: i64,
+    rows: usize,
+    structure: &[MessageStructure],
+) -> Result<()> {
+    clear_structure(tx, &meta.key)?;
+    let mut call = tx.prepare_cached(
+        "INSERT INTO tool_calls(session_key, seq, idx, call_id, name, input, output, is_error, child_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+    )?;
+    let mut extra = tx.prepare_cached(
+        "INSERT INTO message_extras(session_key, seq, kind, thinking, model, full_text)
+         VALUES (?1,?2,'text',?3,?4,?5)",
+    )?;
+    for m in structure {
+        for (idx, tc) in m.tool_calls.iter().enumerate() {
+            call.execute(params![
+                meta.key,
+                m.seq,
+                idx as i64,
+                tc.id,
+                tc.name,
+                tc.input,
+                tc.output,
+                tc.is_error,
+                tc.child_id
+            ])?;
+        }
+        if m.thinking.is_some() || m.model.is_some() || m.full_text.is_some() {
+            extra.execute(params![meta.key, m.seq, m.thinking, m.model, m.full_text])?;
+        }
+    }
+    tx.execute(
+        "INSERT INTO structure_sessions(session_key, file_mtime, file_size, fts_format, rows, format)
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![meta.key, file_mtime, meta.size_bytes, FTS_FORMAT, rows as i64, STRUCTURE_FORMAT],
+    )?;
     Ok(())
 }
 

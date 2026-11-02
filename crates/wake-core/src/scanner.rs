@@ -448,7 +448,8 @@ fn run_scan_inner(
     // FTS 派生规则换代(db::FTS_FORMAT):这一轮把 mtime/size 没变的也全部重解析。
     // 跑完就清旗子,不按"全部成功"重试——解析失败的文件下次也不会自己好,它变了
     // 自然走增量重解析;留着旗子只会让每次启动都全量一遍
-    let force_reindex = store.needs_fts_reindex();
+    let force_structure = store.needs_structure_reindex();
+    let force_reindex = store.needs_fts_reindex() || force_structure;
     let known = store.known_files()?;
     let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     struct WorkItem<'a> {
@@ -659,6 +660,7 @@ fn run_scan_inner(
                     item.r.mtime_ms,
                     &parsed.units,
                     &parsed.wake_lookups,
+                    &parsed.structure,
                     &rank_of(adapters, meta.agent),
                     None,
                 ) {
@@ -695,6 +697,7 @@ fn run_scan_inner(
                                 fb.mtime_ms,
                                 &parsed.units,
                                 &parsed.wake_lookups,
+                                &parsed.structure,
                                 &rank_of(adapters, meta.agent),
                                 Some((item.r.file_path.as_str(), item.r.mtime_ms)),
                             ) {
@@ -735,6 +738,9 @@ fn run_scan_inner(
     }
     if force_reindex {
         store.finish_fts_reindex()?;
+    }
+    if force_structure {
+        store.finish_structure_reindex()?;
     }
 
     Ok(())
@@ -1220,6 +1226,7 @@ fn reparse_for_parent_change(
         reference.mtime_ms,
         &parsed.units,
         &parsed.wake_lookups,
+        &parsed.structure,
         &rank_of(adapters, agent),
         None,
     ) {
@@ -1307,6 +1314,7 @@ pub fn scan_files(
                             r.mtime_ms,
                             &parsed.units,
                             &parsed.wake_lookups,
+                            &parsed.structure,
                             &rank_of(adapters, meta.agent),
                             None,
                         )

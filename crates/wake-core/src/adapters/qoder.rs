@@ -102,7 +102,7 @@ fn flush_assistant(
     {
         return;
     }
-    let (text, truncated) = clip(text.trim(), MAX_MSG_TEXT);
+    let (text, truncated, full_text) = clip_message(text.trim());
     let thinking = if p.thinking.is_empty() {
         None
     } else {
@@ -120,6 +120,7 @@ fn flush_assistant(
         kind: MessageKind::Text,
         text,
         truncated,
+        full_text,
         tool_calls: p.tool_calls,
         thinking,
         timestamp: p.timestamp,
@@ -378,6 +379,7 @@ fn parse_qoder_jsonl(path: &Path, decode_images: bool) -> Result<QoderParse> {
                     kind: MessageKind::CompactSummary,
                     text: "── Context compacted ──".to_string(),
                     truncated: false,
+                    full_text: None,
                     tool_calls: Vec::new(),
                     thinking: None,
                     timestamp: (ts > 0).then_some(ts),
@@ -461,13 +463,14 @@ fn parse_qoder_jsonl(path: &Path, decode_images: bool) -> Result<QoderParse> {
             } else {
                 MessageKind::Text
             };
-            let (text, truncated) = clip(&text, MAX_MSG_TEXT);
+            let (text, truncated, full_text) = clip_message(&text);
             messages.push(TranscriptMessage {
                 seq: 0,
                 role: Role::User,
                 kind,
                 text,
                 truncated,
+                full_text,
                 tool_calls: Vec::new(),
                 thinking: None,
                 timestamp: (ts > 0).then_some(ts),
@@ -646,7 +649,8 @@ impl AgentAdapter for QoderAdapter {
     }
 
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
-        let (meta, parsed) = parse(r, false)?;
+        let (meta, mut parsed) = parse(r, false)?;
+        link_subagents(&session_dir(r), &mut parsed.messages);
         Ok(ParsedSession::derive(
             meta,
             &parsed.messages,

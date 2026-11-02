@@ -722,13 +722,14 @@ impl BlockAcc {
         {
             return None;
         }
-        let (clipped, truncated) = clip(&text, MAX_MSG_TEXT);
+        let (clipped, truncated, full_text) = clip_message(&text);
         Some(TranscriptMessage {
             seq: 0,
             role,
             kind,
             text: clipped,
             truncated,
+            full_text,
             tool_calls: self.tools,
             thinking: if self.thinking.is_empty() {
                 None

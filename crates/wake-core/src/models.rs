@@ -376,6 +376,9 @@ pub struct TranscriptMessage {
     pub kind: MessageKind,
     pub text: String,
     pub truncated: bool,
+    /// Uncut message body for the index side table; not part of Wake output.
+    #[serde(skip)]
+    pub full_text: Option<String>,
     pub tool_calls: Vec<ToolCallView>,
     pub thinking: Option<String>,
     /// epoch ms
@@ -474,6 +477,17 @@ pub struct ParsedSession {
     /// wake-cli / wake-mcp),落 wake_lookups 表。与 units 同一处派生
     /// (`ParsedSession::derive`):自指回声过滤把这些调用从索引里跳过了,不记就没有仪表
     pub wake_lookups: Vec<WakeLookup>,
+    pub structure: Vec<MessageStructure>,
+}
+
+/// Structure for a message that has an index row. Text and FTS stay unchanged.
+#[derive(Debug, Clone)]
+pub struct MessageStructure {
+    pub seq: i64,
+    pub tool_calls: Vec<ToolCallView>,
+    pub thinking: Option<String>,
+    pub model: Option<String>,
+    pub full_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

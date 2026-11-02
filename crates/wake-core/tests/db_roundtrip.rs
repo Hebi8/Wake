@@ -1224,7 +1224,7 @@ fn wake_lookups_follow_the_session_and_reach_insights() {
         };
     let write = |m: &SessionMeta, mtime: i64, lookups: &[WakeLookup]| {
         assert!(store
-            .write_session_guarded(m, mtime, &[], lookups, &|_| 0, None)
+            .write_session_guarded(m, mtime, &[], lookups, &[], &|_| 0, None)
             .unwrap());
     };
     let tally = |name: &str, mcp: i64, cli: i64| LookupTally {
@@ -1298,7 +1298,7 @@ fn guarded_write_respects_winner() {
     loser.file_path = "/backup/g.jsonl".into();
     assert!(
         !store
-            .write_session_guarded(&loser, 5, &[], &[], &|_| 0, None)
+            .write_session_guarded(&loser, 5, &[], &[], &[], &|_| 0, None)
             .unwrap(),
         "败方不该写入"
     );
@@ -1309,7 +1309,7 @@ fn guarded_write_respects_winner() {
 
     assert!(
         store
-            .write_session_guarded(&loser, 12, &[], &[], &|_| 0, None)
+            .write_session_guarded(&loser, 12, &[], &[], &[], &|_| 0, None)
             .unwrap(),
         "反超应接管"
     );
@@ -1329,7 +1329,7 @@ fn guarded_write_respects_winner() {
     cli.file_path = "/cli/h.jsonl".into();
     assert!(
         store
-            .write_session_guarded(&cli, 5, &[], &[], &rank_of, None)
+            .write_session_guarded(&cli, 5, &[], &[], &[], &rank_of, None)
             .unwrap(),
         "rank 靠前的较旧副本应接管"
     );
@@ -1339,7 +1339,7 @@ fn guarded_write_respects_winner() {
     );
     assert!(
         !store
-            .write_session_guarded(&ide, 12, &[], &[], &rank_of, None)
+            .write_session_guarded(&ide, 12, &[], &[], &[], &rank_of, None)
             .unwrap(),
         "rank 靠后的较新副本不得反超"
     );
@@ -1350,13 +1350,13 @@ fn guarded_write_respects_winner() {
     // 另一份副本,照常裁决、不误删(2026-09-15 Codex review 三、四轮)
     assert!(
         !store
-            .write_session_guarded(&ide, 12, &[], &[], &rank_of, Some(("/cli/h.jsonl", 4)))
+            .write_session_guarded(&ide, 12, &[], &[], &[], &rank_of, Some(("/cli/h.jsonl", 4)))
             .unwrap(),
         "同路径但库里版本更新(mtime 更大)不让位"
     );
     assert!(
         store
-            .write_session_guarded(&ide, 12, &[], &[], &rank_of, Some(("/cli/h.jsonl", 5)))
+            .write_session_guarded(&ide, 12, &[], &[], &[], &rank_of, Some(("/cli/h.jsonl", 5)))
             .unwrap(),
         "失效的胜者行让位给回退副本"
     );
@@ -1369,7 +1369,15 @@ fn guarded_write_respects_winner() {
     third.file_path = "/store2/state.vscdb#h".into();
     assert!(
         !store
-            .write_session_guarded(&third, 3, &[], &[], &rank_of, Some(("/cli/h.jsonl", 5)))
+            .write_session_guarded(
+                &third,
+                3,
+                &[],
+                &[],
+                &[],
+                &rank_of,
+                Some(("/cli/h.jsonl", 5))
+            )
             .unwrap(),
         "库里已是别的副本时 supersedes 不生效,按位次与 mtime 照常裁决"
     );
@@ -1386,7 +1394,15 @@ fn guarded_write_respects_winner() {
     p_ide.file_path = "/store/state.vscdb#p".into();
     assert!(
         store
-            .write_session_guarded(&p_ide, 12, &[], &[], &rank_of, Some(("/cli/p.jsonl", 5)))
+            .write_session_guarded(
+                &p_ide,
+                12,
+                &[],
+                &[],
+                &[],
+                &rank_of,
+                Some(("/cli/p.jsonl", 5))
+            )
             .unwrap(),
         "占位行让位给回退副本"
     );
@@ -2121,7 +2137,7 @@ fn memory_source_overrides_roundtrip() {
     orphan.project_path = String::new();
     for s in [&local, &remote, &orphan] {
         store
-            .write_session_guarded(s, 1, &[], &[], &|_| 0, None)
+            .write_session_guarded(s, 1, &[], &[], &[], &|_| 0, None)
             .unwrap();
     }
     assert_eq!(
@@ -2308,7 +2324,7 @@ fn memories_resolve_their_project_through_the_anchor_session() {
     s1.project_path = "/work/app".into();
     s1.project_name = "app".into();
     store
-        .write_session_guarded(&s1, 5, &[], &[], &|_| 0, None)
+        .write_session_guarded(&s1, 5, &[], &[], &[], &|_| 0, None)
         .unwrap();
     assert_eq!(project_of(&anchored.key), "/work/app");
     assert_eq!(
@@ -2362,7 +2378,7 @@ fn memories_resolve_their_project_through_the_anchor_session() {
     s1.project_path = "/work/app-renamed".into();
     s1.project_name = "app-renamed".into();
     store
-        .write_session_guarded(&s1, 6, &[], &[], &|_| 0, None)
+        .write_session_guarded(&s1, 6, &[], &[], &[], &|_| 0, None)
         .unwrap();
     assert_eq!(project_of(&anchored.key), "/work/app-renamed");
 
@@ -2672,7 +2688,7 @@ fn claims_hide_the_copy_until_released() {
     assert_eq!(store.claimants().unwrap(), vec![AgentId::CraftAgents]);
     // 全量 / 增量共用的写入闸门与 quick 路径都挡
     assert!(!store
-        .write_session_guarded(&copy, copy.updated_at, &[], &[], &never_ranks, None)
+        .write_session_guarded(&copy, copy.updated_at, &[], &[], &[], &never_ranks, None)
         .unwrap());
     store.write_meta_only(&[(copy.clone(), 0)]).unwrap();
     assert!(store.get_session(&copy.key).unwrap().is_none());
@@ -2686,7 +2702,7 @@ fn claims_hide_the_copy_until_released() {
     assert!(!store.is_key_claimed(&copy.key));
     assert!(store.claimants().unwrap().is_empty());
     assert!(store
-        .write_session_guarded(&copy, copy.updated_at, &[], &[], &never_ranks, None)
+        .write_session_guarded(&copy, copy.updated_at, &[], &[], &[], &never_ranks, None)
         .unwrap());
     assert!(store.get_session(&copy.key).unwrap().is_some());
 }

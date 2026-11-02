@@ -409,13 +409,14 @@ impl Turn {
         if turn.content.text.is_empty() && turn.thinking.is_empty() && turn.tool_calls.is_empty() {
             return;
         }
-        let (text, truncated) = clip(&turn.content.text, MAX_MSG_TEXT);
+        let (text, truncated, full_text) = clip_message(&turn.content.text);
         messages.push(TranscriptMessage {
             seq: 0,
             role: Role::Assistant,
             kind: MessageKind::Text,
             text,
             truncated,
+            full_text,
             tool_calls: turn.tool_calls,
             thinking: (!turn.thinking.is_empty())
                 .then(|| clip(&turn.thinking.join("\n\n"), MAX_TOOL_IO).0),

@@ -591,7 +591,7 @@ fn flush_assistant(
     if text.is_empty() && p.thinking.is_empty() && p.tool_calls.is_empty() && images.is_empty() {
         return;
     }
-    let (clipped, truncated) = clip(&text, MAX_MSG_TEXT);
+    let (clipped, truncated, full_text) = clip_message(&text);
     let thinking = if p.thinking.is_empty() {
         None
     } else {
@@ -610,6 +610,7 @@ fn flush_assistant(
         kind: MessageKind::Text,
         text: clipped,
         truncated,
+        full_text,
         tool_calls: p.tool_calls,
         thinking,
         timestamp: p.timestamp,
@@ -740,6 +741,7 @@ fn parse_claude_jsonl(
                         kind: MessageKind::Meta,
                         text,
                         truncated,
+                        full_text: None,
                         tool_calls: Vec::new(),
                         thinking: None,
                         timestamp: ts_opt(ts),
@@ -816,13 +818,14 @@ fn parse_claude_jsonl(
             if kind == MessageKind::Text && fallback_title.is_empty() && !in_prefix {
                 fallback_title = clean_title_candidate(&text);
             }
-            let (clipped, truncated) = clip(&text, MAX_MSG_TEXT);
+            let (clipped, truncated, full_text) = clip_message(&text);
             messages.push(TranscriptMessage {
                 seq: 0,
                 role: Role::User,
                 kind,
                 text: clipped,
                 truncated,
+                full_text,
                 tool_calls: Vec::new(),
                 thinking: None,
                 timestamp: ts_opt(ts),
@@ -968,6 +971,7 @@ fn mk_msg(role: Role, kind: MessageKind, text: &str, ts: i64) -> TranscriptMessa
         kind,
         text: text.to_string(),
         truncated: false,
+        full_text: None,
         tool_calls: Vec::new(),
         thinking: None,
         timestamp: ts_opt(ts),
@@ -1102,7 +1106,8 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
-        let (meta, parsed) = self.parse(r, false)?;
+        let (meta, mut parsed) = self.parse(r, false)?;
+        link_subagents(&session_dir(r), &mut parsed.messages);
         Ok(ParsedSession::derive(
             meta,
             &parsed.messages,

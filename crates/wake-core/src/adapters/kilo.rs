@@ -839,7 +839,7 @@ impl LegacyParse {
             return;
         }
         let ParsedContent { text, images } = content;
-        let (text, truncated) = clip(&text, MAX_MSG_TEXT);
+        let (text, truncated, full_text) = clip_message(&text);
         let ix = self.messages.len();
         for (ti, tool) in tools.iter().enumerate() {
             if !tool.id.is_empty() {
@@ -852,6 +852,7 @@ impl LegacyParse {
             kind: MessageKind::Text,
             text,
             truncated,
+            full_text,
             tool_calls: tools,
             thinking: (!thinking.is_empty()).then(|| clip(&thinking.join("\n\n"), MAX_TOOL_IO).0),
             timestamp: (ts > 0).then_some(ts),
