@@ -116,6 +116,18 @@ fn resolve(path: &str, cwd: &str) -> String {
     // not the host's Path::components rules (notably POSIX paths on Windows).
     let windows_drive =
         |s: &str| matches!(s.as_bytes(), [d, b':', b'/' | b'\\', ..] if d.is_ascii_alphabetic());
+    let drive_relative =
+        matches!(path.as_bytes(), [d, b':', ..] if d.is_ascii_alphabetic()) && !windows_drive(path);
+    let path = if drive_relative {
+        if windows_drive(cwd) && path[..1].eq_ignore_ascii_case(&cwd[..1]) {
+            &path[2..]
+        } else {
+            // Another drive's current directory is not supplied by this session.
+            return path.to_owned();
+        }
+    } else {
+        path
+    };
     let windows = windows_drive(path)
         || path.starts_with("\\\\")
         || windows_drive(cwd)
@@ -325,5 +337,18 @@ mod tests {
             resolve(r"\tmp\alice.txt", r"\\server\share\project"),
             r"\\server\share\tmp\alice.txt"
         );
+    }
+    #[test]
+    fn windows_drive_relative_paths_use_only_the_known_drive_cwd() {
+        let cwd = r"C:\Users\alice\project";
+        assert_eq!(
+            resolve("C:alice.txt", cwd),
+            r"C:\Users\alice\project\alice.txt"
+        );
+        assert_eq!(resolve(r"c:..\alice.txt", cwd), r"C:\Users\alice\alice.txt");
+        assert_eq!(resolve("C:", cwd), cwd);
+        assert_eq!(resolve("D:alice.txt", cwd), "D:alice.txt");
+        assert_eq!(resolve("C:alice.txt", ""), "C:alice.txt");
+        assert_eq!(resolve("C:alice.txt", "/home/alice/project"), "C:alice.txt");
     }
 }
