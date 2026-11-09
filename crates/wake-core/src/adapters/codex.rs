@@ -399,7 +399,7 @@ struct CodexParse {
     /// rollout 首行 originator 的友好名。state DB 的 source 列会把
     /// Codex Desktop 与 IDE 扩展都归为 "vscode",originator 才分得开。
     source: Option<String>,
-    tokens_used: i64,
+    tokens_used: Option<i64>,
     created_at: i64,
     updated_at: i64,
     unknown_lines: u32,
@@ -568,6 +568,107 @@ fn environment_cwd(text: &str) -> Option<String> {
         .flatten()
 }
 
+// Codex's Responses usage includes cache read/write in input and reasoning in output.
+// See codex-api/src/sse/responses.rs (ResponseCompletedUsage -> TokenUsage).
+fn response_usage(value: &Value) -> Option<TokenUsage> {
+    let input = value.get("input_tokens").and_then(Value::as_i64);
+    let cache_read = value.get("cached_input_tokens").and_then(Value::as_i64);
+    let cache_write = value
+        .get("cache_write_input_tokens")
+        .and_then(Value::as_i64);
+    let usage = TokenUsage {
+        input: input.map(|n| n - cache_read.unwrap_or(0) - cache_write.unwrap_or(0)),
+        output: value.get("output_tokens").and_then(Value::as_i64),
+        cache_read,
+        cache_write,
+    };
+    (usage != TokenUsage::default()).then_some(usage)
+}
+
+// A response can produce several display messages. Its final model item owns usage;
+// tools and reasoning in the next response must not reuse the completed host.
+#[derive(Default)]
+struct ResponseOwner {
+    start: usize,
+    message: Option<usize>,
+}
+
+impl ResponseOwner {
+    fn reset(&mut self, len: usize) {
+        self.start = len;
+        self.message = None;
+    }
+
+    fn complete(
+        &mut self,
+        messages: &mut Vec<TranscriptMessage>,
+        usage: TokenUsage,
+        ts: i64,
+    ) -> usize {
+        let owner = self.message.unwrap_or_else(|| {
+            messages.push(mk_msg(Role::Assistant, MessageKind::Text, "", ts));
+            messages.len() - 1
+        });
+        messages[owner].usage = Some(usage);
+        self.reset(messages.len());
+        owner
+    }
+}
+
+// Only source-defined process status fields/header lines count as errors. In particular,
+// stdout mentioning an error or an exit code is not a process status.
+fn output_exit_code(output: &Value) -> Option<i64> {
+    if let Some(code) = output.get("exit_code").and_then(Value::as_i64).or_else(|| {
+        output
+            .pointer("/metadata/exit_code")
+            .and_then(Value::as_i64)
+    }) {
+        return Some(code);
+    }
+    if let Some(content) = output.get("content") {
+        return output_exit_code(content);
+    }
+    if let Some(parts) = output.as_array() {
+        return parts.iter().find_map(|part| {
+            matches!(
+                part.get("type").and_then(Value::as_str),
+                Some("input_text" | "text")
+            )
+            .then(|| part.get("text").and_then(output_exit_code))
+            .flatten()
+        });
+    }
+    let text = output.as_str()?;
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        if value.is_object() {
+            return output_exit_code(&value);
+        }
+    }
+    let mut lines = text.lines();
+    let first = lines.next()?;
+    // core/src/tools/mod.rs: the shell formatter starts with Exit code, then Wall time.
+    if let Some(code) = first.strip_prefix("Exit code: ") {
+        return lines
+            .next()?
+            .starts_with("Wall time: ")
+            .then(|| code.parse().ok())
+            .flatten();
+    }
+    // core/src/tools/context.rs: unified exec puts the status after its timing header.
+    if !first.starts_with("Chunk ID: ") && !first.starts_with("Wall time: ") {
+        return None;
+    }
+    for line in lines.take_while(|line| *line != "Output:" && *line != "Final output:") {
+        if let Some(code) = line
+            .strip_prefix("Process exited with code ")
+            .or_else(|| line.strip_prefix("Exit code: "))
+        {
+            return code.parse().ok();
+        }
+    }
+    None
+}
+
 fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
     let _image_budget = transcript_image_decode_budget(decode_images);
     let reader = open_rollout(path, 1 << 20)?;
@@ -576,11 +677,16 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
     let mut event_fallback: Vec<TranscriptMessage> = Vec::new();
     let mut tool_index: HashMap<String, (usize, usize)> = HashMap::new();
     let mut pending_review_message: Option<usize> = None;
+    let mut response = ResponseOwner::default();
+    let mut fallback_response = ResponseOwner::default();
+    let mut response_ids: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut last_count_total = 0;
+    let mut current_since_count = false;
     let mut cwd = String::new();
     let mut git_branch: Option<String> = None;
     let mut model: Option<String> = None;
     let mut source: Option<String> = None;
-    let mut tokens_used: i64 = 0;
+    let mut tokens_used: Option<i64> = None;
     let mut created_at: i64 = 0;
     let mut updated_at: i64 = 0;
     let mut unknown_lines: u32 = 0;
@@ -593,7 +699,7 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
     // 老格式(is_legacy_header):条目本身就是 response_item 的 payload
     let mut legacy = false;
     // 用量记录里整个线程的累计,只在文件里没有 token_count 时用
-    let mut usage_record_tokens: i64 = 0;
+    let mut usage_record_tokens: Option<i64> = None;
 
     for (i, row) in jsonl_values(reader).enumerate() {
         let Some(row) = row? else {
@@ -626,6 +732,8 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                 .is_some_and(|ordinal| ordinal >= start)
             {
                 inherited = Some((messages.len(), event_fallback.len()));
+                response.reset(messages.len());
+                fallback_response.reset(event_fallback.len());
             }
         }
         let (typ, payload) = if legacy {
@@ -690,6 +798,9 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                 match pt {
                     "message" => {
                         let role = payload.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                        if role != "assistant" {
+                            response.reset(messages.len());
+                        }
                         let content = payload.get("content").unwrap_or(&Value::Null);
                         let blocks = content
                             .as_array()
@@ -735,6 +846,9 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                         };
                         message.images = images;
                         messages.push(message);
+                        if role == "assistant" {
+                            response.message = Some(messages.len() - 1);
+                        }
                     }
                     "reasoning" => {
                         // encrypted_content 丢弃,只取明文 summary
@@ -751,9 +865,11 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                             // 同 need_host:fork 段里的宿主待会儿会被 splice 掉
                             let last_is_inherited =
                                 inherited.is_some_and(|(cut, _)| messages.len() <= cut);
+                            let messages_len = messages.len();
                             match messages.last_mut() {
                                 Some(last)
                                     if !last_is_inherited
+                                        && response.start < messages_len
                                         && last.role == Role::Assistant
                                         && last.text.is_empty()
                                         && last.thinking.is_none() =>
@@ -766,6 +882,7 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                                     messages.push(m);
                                 }
                             }
+                            response.message = Some(messages.len() - 1);
                         }
                     }
                     "function_call" | "custom_tool_call" | "local_shell_call" => {
@@ -800,7 +917,7 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                             input: if raw_input.is_empty() {
                                 None
                             } else {
-                                Some(clip(&raw_input, MAX_TOOL_IO).0)
+                                Some(raw_input)
                             },
                             output: None,
                             is_error: false,
@@ -812,6 +929,7 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                         let last_is_inherited =
                             inherited.is_some_and(|(cut, _)| messages.len() <= cut);
                         let need_host = last_is_inherited
+                            || messages.len() <= response.start
                             || !matches!(
                                 messages.last(),
                                 Some(m) if m.role == Role::Assistant && m.kind == MessageKind::Text
@@ -820,6 +938,7 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                             messages.push(mk_msg(Role::Assistant, MessageKind::Text, "", ts));
                         }
                         let mi = messages.len() - 1;
+                        response.message = Some(mi);
                         let host = &mut messages[mi];
                         host.tool_calls.push(call);
                         if !call_id.is_empty() {
@@ -836,6 +955,8 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                             let content = output.get("content").unwrap_or(output);
                             let parsed = tool_result_parts(content, decode_images);
                             let message = &mut messages[mi];
+                            message.tool_calls[ti].is_error =
+                                output_exit_code(output).is_some_and(|code| code != 0);
                             message.tool_calls[ti].output = Some(clip(&parsed.text, MAX_TOOL_IO).0);
                             append_images_to_message_end(message, parsed.images);
                         }
@@ -855,6 +976,8 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                             let to = payload.get("recipient").and_then(Value::as_str);
                             if !mine.is_empty() && to == Some(mine) {
                                 inherited = Some((messages.len(), event_fallback.len()));
+                                response.reset(messages.len());
+                                fallback_response.reset(event_fallback.len());
                             }
                         }
                     }
@@ -866,15 +989,30 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                 match pt {
                     "token_count" => {
                         if let Some(total) = payload
-                            .get("info")
-                            .and_then(|i| i.get("total_token_usage"))
-                            .and_then(|u| u.get("total_tokens"))
-                            .and_then(|v| v.as_i64())
+                            .pointer("/info/total_token_usage/total_tokens")
+                            .and_then(Value::as_i64)
                         {
-                            tokens_used = total;
+                            tokens_used = Some(total);
+                            // Rate-limit updates replay last_token_usage, sometimes with changed
+                            // detail fields. An unchanged cumulative total is not a new response.
+                            if last_count_total != total {
+                                if !current_since_count {
+                                    if let Some(usage) = payload
+                                        .pointer("/info/last_token_usage")
+                                        .and_then(response_usage)
+                                    {
+                                        response.complete(&mut messages, usage, ts);
+                                        fallback_response.complete(&mut event_fallback, usage, ts);
+                                    }
+                                }
+                                last_count_total = total;
+                            }
+                            current_since_count = false;
                         }
                     }
                     "user_message" => {
+                        response.reset(messages.len());
+                        fallback_response.reset(event_fallback.len());
                         if let Some(m) = payload.get("message").and_then(|v| v.as_str()) {
                             let cleaned = clean_user_text(m);
                             if !cleaned.trim().is_empty() {
@@ -906,6 +1044,7 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                                     &text,
                                     ts,
                                 ));
+                                fallback_response.message = Some(event_fallback.len() - 1);
                             }
                         }
                     }
@@ -948,16 +1087,29 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
             }
             // 子线程每收一次派活就有一行,内容只有 {"trigger_turn":true}
             "world_state" | "inter_agent_communication_metadata" => {}
-            // 0.156 起每次模型调用记一行用量(这一次 / 这一轮 / 整个线程三份)。token 仍以
-            // event_msg 的 token_count 为准:两种在同一文件里同时出现(本机 51 份全是),整个线程
-            // 那份又与 token_count 不总相等(14 份多出约 2%)。一份文件只认一个来源,这里只记下
-            // 来,哪天 Codex 不写 token_count 了才用它
+            // Observed usage is written at response completion, before token_count.
+            // Prefer it for that response only: older portions of a resumed file may
+            // still contain just token_count. Do not add turn/thread snapshots to calls.
             "token_usage_record" => {
                 if let Some(total) = payload
                     .pointer("/thread_token_usage/total_tokens")
                     .and_then(Value::as_i64)
                 {
-                    usage_record_tokens = total;
+                    usage_record_tokens = Some(total);
+                }
+                if let Some(usage) = payload.get("usage").and_then(response_usage) {
+                    let id = payload.get("response_id").and_then(Value::as_str);
+                    if let Some(&(owner, fallback)) = id.and_then(|id| response_ids.get(id)) {
+                        messages[owner].usage = Some(usage);
+                        event_fallback[fallback].usage = Some(usage);
+                    } else {
+                        let owner = response.complete(&mut messages, usage, ts);
+                        let fallback = fallback_response.complete(&mut event_fallback, usage, ts);
+                        if let Some(id) = id {
+                            response_ids.insert(id.to_string(), (owner, fallback));
+                        }
+                        current_since_count = true;
+                    }
                 }
             }
             // 语音会话的起止标记;transcript_segment 这类带内容的子类型还没见过样本,照旧计未知行
@@ -969,7 +1121,7 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
             _ => unknown_lines += 1,
         }
     }
-    if tokens_used == 0 {
+    if tokens_used.is_none() {
         tokens_used = usage_record_tokens;
     }
 
@@ -990,7 +1142,10 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
         .any(|m| m.kind == MessageKind::Text && (!m.text.is_empty() || !m.images.is_empty()));
     let mut final_messages = if has_real {
         messages
-    } else if !event_fallback.is_empty() {
+    } else if event_fallback
+        .iter()
+        .any(|m| !m.text.is_empty() || !m.images.is_empty())
+    {
         event_fallback
     } else {
         messages
@@ -1087,11 +1242,7 @@ fn build_meta(r: &SessionFileRef, p: &CodexParse, archived_dir: &Path) -> Sessio
         size_bytes: r.size,
         git_branch: p.git_branch.clone(),
         model: p.model.clone(),
-        tokens_used: if p.tokens_used > 0 {
-            Some(p.tokens_used)
-        } else {
-            None
-        },
+        tokens_used: p.tokens_used,
         archived: r
             .file_path
             .starts_with(&archived_dir.to_string_lossy().to_string()),
