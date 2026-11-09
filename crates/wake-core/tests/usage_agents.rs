@@ -264,3 +264,51 @@ fn grok_completion_without_counters_stays_an_empty_shell() {
     let adapter = GrokAdapter::new().with_custom_root(tmp.path().to_path_buf());
     assert!(adapter.file_ref(&path).is_none());
 }
+
+#[test]
+fn hermes_status_and_wholly_failed_batches_match_source_semantics() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch(&fs::read_to_string(fixture("hermes.sql")).unwrap())
+        .unwrap();
+    let cases = [
+        (
+            json!({"results":[{"status":"error","error":"Synthetic child failed"}]}),
+            true,
+        ),
+        (json!({"status":"FAILED"}), true),
+        (json!({"status":"error"}), true),
+        (json!({"status":"timeout"}), false),
+        (
+            json!({"results":[{"error":"Synthetic child failed"},{"status":"completed"}]}),
+            false,
+        ),
+        (json!({"results":[]}), false),
+        (json!({"results":[{"error":null}]}), false),
+        (json!({"result":{"error":"Ordinary document field"}}), false),
+        (json!({"guardrail_refusal":true,"status":"failed"}), false),
+    ];
+    for (i, (output, _)) in cases.iter().enumerate() {
+        let id = format!("alice-batch-{i}");
+        db.execute("INSERT INTO messages(session_id,role,tool_calls) VALUES('alice-hermes','assistant',?1)",
+            [json!([{"id":id,"name":"delegate_task","arguments":{}}]).to_string()]).unwrap();
+        db.execute("INSERT INTO messages(session_id,role,content,tool_call_id,tool_name) VALUES('alice-hermes','tool',?1,?2,'delegate_task')",
+            [output.to_string(), id]).unwrap();
+    }
+    drop(db);
+    let adapter = HermesAdapter::new().with_custom_root(tmp.path().to_path_buf());
+    let t = adapter
+        .parse_transcript(&adapter.list_session_files().unwrap()[0])
+        .unwrap();
+    for (i, (_, expected)) in cases.iter().enumerate() {
+        let id = format!("alice-batch-{i}");
+        let call = t
+            .mainline
+            .iter()
+            .flat_map(|m| &m.tool_calls)
+            .find(|c| c.id == id)
+            .unwrap();
+        assert_eq!(call.is_error, *expected, "{id}");
+    }
+}

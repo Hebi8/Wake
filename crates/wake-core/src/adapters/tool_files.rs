@@ -118,13 +118,23 @@ fn resolve(path: &str, cwd: &str) -> String {
         |s: &str| matches!(s.as_bytes(), [d, b':', b'/' | b'\\', ..] if d.is_ascii_alphabetic());
     let windows = windows_drive(path)
         || path.starts_with("\\\\")
-        || (!path.starts_with('/') && (windows_drive(cwd) || cwd.starts_with("\\\\")));
+        || windows_drive(cwd)
+        || cwd.starts_with("\\\\");
     let (path, cwd) = if windows {
         (path.replace('\\', "/"), cwd.replace('\\', "/"))
     } else {
         (path.to_owned(), cwd.to_owned())
     };
-    let joined = if path.starts_with('/') || windows_drive(&path) {
+    let joined = if windows && path.starts_with('/') && !path.starts_with("//") {
+        // A rooted Windows operand keeps the cwd's drive or UNC share.
+        let root = if windows_drive(&cwd) {
+            &cwd[..2]
+        } else {
+            let end = cwd.match_indices('/').nth(3).map_or(cwd.len(), |(i, _)| i);
+            &cwd[..end]
+        };
+        format!("{root}{path}")
+    } else if path.starts_with('/') || windows_drive(&path) {
         path
     } else {
         format!("{cwd}/{path}")
@@ -299,6 +309,21 @@ mod tests {
         assert_eq!(
             resolve(r"..\file.rs", r"\\server\share\project"),
             r"\\server\share\file.rs"
+        );
+    }
+    #[test]
+    fn windows_root_relative_paths_inherit_the_cwd_volume() {
+        assert_eq!(
+            resolve(r"\tmp\alice.txt", r"C:\Users\alice\project"),
+            r"C:\tmp\alice.txt"
+        );
+        assert_eq!(
+            resolve("/tmp/alice.txt", r"C:\Users\alice\project"),
+            r"C:\tmp\alice.txt"
+        );
+        assert_eq!(
+            resolve(r"\tmp\alice.txt", r"\\server\share\project"),
+            r"\\server\share\tmp\alice.txt"
         );
     }
 }

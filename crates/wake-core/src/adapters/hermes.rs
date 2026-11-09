@@ -391,20 +391,21 @@ fn query_rows(ro: &SqliteRo, db: &HermesDb) -> Option<Vec<HermesRow>> {
     rows
 }
 
-/// Only top-level structured signals are evidence of failure. Text mentioning
-/// errors and nested payloads may be ordinary data returned by a successful tool.
+/// Source-defined statuses and wholly failed result batches indicate failure.
+/// Arbitrary nested payloads and text mentioning errors remain ordinary data.
 fn structured_tool_error(name: &str, content: Option<&str>) -> bool {
     let Some(Value::Object(data)) = content.and_then(|s| serde_json::from_str(s).ok()) else {
         return false;
     };
-    let error = data.get("error").is_some_and(|v| match v {
+    let nonempty_error = |v: &Value| match v {
         Value::Null => false,
         Value::Bool(b) => *b,
         Value::String(s) => !s.is_empty(),
         Value::Array(a) => !a.is_empty(),
         Value::Object(o) => !o.is_empty(),
         Value::Number(n) => n.as_f64().is_some_and(|n| n != 0.0),
-    });
+    };
+    let error = data.get("error").is_some_and(nonempty_error);
     // Hermes excludes explicit guardrail refusals and proven landed writes
     // from failures (agent/tool_result_classification.py).
     if data.get("guardrail_refusal").and_then(Value::as_bool) == Some(true)
@@ -415,6 +416,21 @@ fn structured_tool_error(name: &str, content: Option<&str>) -> bool {
         return false;
     }
     error
+        || data
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| {
+                status.eq_ignore_ascii_case("failed") || status.eq_ignore_ascii_case("error")
+            })
+        || data
+            .get("results")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|item| item.get("error").is_some_and(nonempty_error))
+            })
         || data.get("success").and_then(Value::as_bool) == Some(false)
         || data
             .get("exit_code")

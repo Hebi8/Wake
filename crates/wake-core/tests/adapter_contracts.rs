@@ -1663,17 +1663,17 @@ fn codex_usage_and_realtime_records_are_known() {
     let session = adapter.parse_session(&r).unwrap();
     assert_eq!(
         session.meta.tokens_used,
-        Some(3010),
-        "token 以 token_count 的累计为准"
+        Some(110),
+        "逐响应 usage 可得时按保留的调用求和，不采用线程累计快照"
     );
 
-    // 哪天 Codex 不写 token_count 了:退回用量记录里整个线程的累计,不至于没有 token
+    // 去掉旧 token_count 后仍是同一份逐响应 usage，不能改用 thread 累计。
     let without: Vec<serde_json::Value> = lines.into_iter().filter(|l| *l != token_count).collect();
     write(&without);
     let r = adapter.file_ref(&path).unwrap();
     assert_eq!(
         adapter.parse_session(&r).unwrap().meta.tokens_used,
-        Some(4010)
+        Some(110)
     );
 }
 

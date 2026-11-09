@@ -1125,6 +1125,10 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
         tokens_used = usage_record_tokens;
     }
 
+    let has_response_usage = messages
+        .iter()
+        .chain(&event_fallback)
+        .any(|m| m.usage.is_some());
     // fork 段先折叠再判 has_real:折完只剩一条 Meta 的子线程要走得到
     // event_msg 回退,与普通会话同一条路。回退流只截断、**不留标记**——
     // 它一非空就会在 has_real 为假时被选中,一条标记足以把子线程自己的
@@ -1151,6 +1155,19 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
         messages
     };
     assign_seq(&mut final_messages);
+    // A fork's source cumulative counter includes its copied parent history.
+    // Prefer the owned, deduplicated responses; total-only sources keep their total.
+    let tokens_used = if has_response_usage {
+        Some(
+            final_messages
+                .iter()
+                .filter_map(|m| m.usage)
+                .map(TokenUsage::total)
+                .sum(),
+        )
+    } else {
+        tokens_used
+    };
 
     Ok(CodexParse {
         messages: final_messages,

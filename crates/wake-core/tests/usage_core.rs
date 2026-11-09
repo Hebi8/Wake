@@ -434,8 +434,8 @@ fn codex_inherited_prefix_excludes_message_usage() {
         assert_eq!(t.mainline[0].kind, MessageKind::Meta);
         assert_eq!(usages(&t), [usage(30, 10, 20, None)]);
         assert_eq!(t.mainline[1].tool_calls[0].id, "own");
-        // Preserve Codex's source-provided session cumulative total.
-        assert_eq!(t.meta.tokens_used, Some(180));
+        // The copied parent is excluded from the session total as well.
+        assert_eq!(t.meta.tokens_used, Some(60));
     }
 }
 
@@ -584,4 +584,33 @@ fn codex_current_and_legacy_usage_only_responses_do_not_reuse_tool_hosts() {
     assert!(t.mainline[1].tool_calls.is_empty());
     assert_eq!(t.mainline[2].tool_calls[0].id, "next");
     assert_eq!(usages(&t).len(), 3);
+}
+
+#[test]
+fn codex_total_only_source_keeps_its_reported_session_total() {
+    let t = parse(
+        "codex",
+        &[
+            text("assistant", "Legacy response without call counters"),
+            event(json!({"type":"token_count","info":{"total_token_usage":{"total_tokens":120}}})),
+        ],
+    );
+    assert!(usages(&t).is_empty());
+    assert_eq!(t.meta.tokens_used, Some(120));
+}
+
+#[test]
+fn codex_fork_with_only_inherited_usage_has_zero_owned_tokens() {
+    let t = parse(
+        "codex",
+        &[
+            json!({"type":"session_meta","payload":{"cwd":"/home/alice/project","source":{"subagent":{"thread_spawn":{"agent_path":"/root/alice"}}}}}),
+            text("assistant", "Inherited response"),
+            current("parent", source_usage(100, 20, 60), 120),
+            count(source_usage(100, 20, 60), 120),
+            item(json!({"type":"agent_message","recipient":"/root/alice"})),
+        ],
+    );
+    assert!(usages(&t).is_empty());
+    assert_eq!(t.meta.tokens_used, Some(0));
 }
