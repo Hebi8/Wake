@@ -746,7 +746,7 @@ impl ParsedSession {
     ) -> Self {
         let units = units_from_messages(messages);
         let indexed: std::collections::HashSet<_> = units.iter().map(|u| u.seq).collect();
-        let structure = messages
+        let mut structure: Vec<MessageStructure> = messages
             .iter()
             .filter(|m| m.kind == MessageKind::Text && indexed.contains(&m.seq))
             .map(|m| {
@@ -773,6 +773,26 @@ impl ParsedSession {
                 }
             })
             .collect();
+        // Usage must follow an indexed assistant, even when its original host is
+        // reasoning-only or contains only a Wake lookup excluded from the FTS.
+        for message in messages
+            .iter()
+            .filter(|m| m.kind == MessageKind::Text && !indexed.contains(&m.seq))
+        {
+            if let Some(usage) = message.usage {
+                let owner = units
+                    .iter()
+                    .rposition(|u| u.role == Role::Assistant && u.seq < message.seq)
+                    .or_else(|| {
+                        units
+                            .iter()
+                            .position(|u| u.role == Role::Assistant && u.seq > message.seq)
+                    });
+                if let Some(owner) = owner {
+                    structure[owner].usage.get_or_insert_default().add(usage);
+                }
+            }
+        }
         Self {
             units,
             structure,

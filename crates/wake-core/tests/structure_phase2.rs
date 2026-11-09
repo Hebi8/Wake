@@ -177,3 +177,89 @@ fn format_one_index_gets_usage_columns_and_files_on_unchanged_source_refresh() {
         "2"
     );
 }
+
+#[test]
+fn codex_code_mode_long_patch_keeps_the_last_file_before_input_clipping() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("alice.jsonl");
+    let patch=format!("*** Begin Patch\n*** Add File: first.rs\n+{}\n*** Update File: last.rs\n@@\n-a\n+b\n*** End Patch", "x".repeat(20*1024));
+    let code = format!(
+        "const patch = {}; text(await tools.apply_patch(patch));",
+        serde_json::to_string(&patch).unwrap()
+    );
+    write_lines(
+        &path,
+        &[
+            json!({"type":"session_meta","payload":{"id":"alice-code-mode","cwd":"/home/alice/project"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","name":"exec","call_id":"patch","arguments":code}}),
+        ],
+    );
+    let adapter = CodexAdapter::new().with_custom_root(dir.path().to_owned());
+    let r = adapter.file_ref(&path).unwrap();
+    let parsed = adapter.parse_session(&r).unwrap();
+    assert_eq!(
+        file_rows(&parsed),
+        vec![
+            (0, "/home/alice/project/first.rs".into(), "change"),
+            (0, "/home/alice/project/last.rs".into(), "change")
+        ]
+    );
+    assert!(!parsed.structure[0].tool_calls[0]
+        .input
+        .as_deref()
+        .unwrap()
+        .contains("last.rs"));
+}
+
+#[test]
+fn stored_usage_matches_session_accounting_after_unindexed_hosts_are_folded() {
+    for agent in ["claude", "codex"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(if agent == "claude" {
+            "projects/-home-alice-project/alice.jsonl"
+        } else {
+            "alice.jsonl"
+        });
+        let rows = if agent == "claude" {
+            vec![
+                json!({"type":"assistant","message":{"id":"a","role":"assistant","usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":4,"cache_creation_input_tokens":1},"content":[{"type":"tool_use","id":"lookup","name":"Bash","input":{"command":"wake-cli search synthetic"}}]}}),
+                json!({"type":"assistant","message":{"id":"b","role":"assistant","usage":{"input_tokens":20,"output_tokens":3,"cache_read_input_tokens":5,"cache_creation_input_tokens":2},"content":[{"type":"text","text":"Visible synthetic answer"}]}}),
+            ]
+        } else {
+            vec![
+                json!({"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Synthetic reasoning"}]}}),
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2,"cached_input_tokens":4},"total_token_usage":{"total_tokens":12}}}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Visible synthetic answer"}]}}),
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20,"output_tokens":3,"cached_input_tokens":5},"total_token_usage":{"total_tokens":35}}}}),
+            ]
+        };
+        write_lines(&path, &rows);
+        let adapter: Box<dyn AgentAdapter> = if agent == "claude" {
+            ClaudeAdapter::new().with_custom_root(dir.path().to_owned())
+        } else {
+            CodexAdapter::new().with_custom_root(dir.path().to_owned())
+        };
+        let r = adapter.file_ref(&path).unwrap();
+        let parsed = adapter.parse_session(&r).unwrap();
+        assert_eq!(parsed.units.len(), 1);
+        let db = dir.path().join("index.db");
+        let store = Store::open(&db).unwrap();
+        store
+            .write_session_guarded(
+                &parsed.meta,
+                r.mtime_ms,
+                &parsed.units,
+                &parsed.wake_lookups,
+                &parsed.structure,
+                &|_| 0,
+                None,
+            )
+            .unwrap();
+        let conn = Connection::open(db).unwrap();
+        let (input,output,read,write):(i64,i64,i64,i64)=conn.query_row("SELECT SUM(COALESCE(input_tokens,0)),SUM(COALESCE(output_tokens,0)),SUM(COALESCE(cache_read_tokens,0)),SUM(COALESCE(cache_write_tokens,0)) FROM message_extras",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(
+            Some(input + output + write + if agent == "codex" { read } else { 0 }),
+            parsed.meta.tokens_used
+        );
+    }
+}

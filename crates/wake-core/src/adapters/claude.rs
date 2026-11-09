@@ -556,6 +556,7 @@ struct ParseResult {
     git_branch: Option<String>,
     model: Option<String>,
     tokens_used: Option<i64>,
+    source: Option<String>,
     created_at: i64,
     updated_at: i64,
     unknown_lines: u32,
@@ -641,6 +642,7 @@ fn parse_claude_jsonl(
     let mut ai_title = String::new();
     let mut fallback_title = String::new();
     let mut cwd = String::new();
+    let mut source = None;
     let mut git_branch: Option<String> = None;
     let mut model: Option<String> = None;
     // One owner per API id, including repeats separated by other messages.
@@ -677,6 +679,12 @@ fn parse_claude_jsonl(
             }
         }
         let in_prefix = inherited.is_some() && cut.is_none();
+        if !in_prefix && source.is_none() {
+            source = row
+                .get("entrypoint")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
         if !in_prefix && own_created_at == 0 {
             own_created_at = row.get("timestamp").map(to_epoch_ms).unwrap_or(0);
         }
@@ -971,6 +979,7 @@ fn parse_claude_jsonl(
         git_branch,
         model,
         tokens_used,
+        source,
         created_at,
         updated_at,
         unknown_lines,
@@ -1064,7 +1073,7 @@ fn build_meta(r: &SessionFileRef, p: &ParseResult) -> SessionMeta {
         model: p.model.clone(),
         tokens_used: p.tokens_used,
         archived: false,
-        source: None,
+        source: p.source.clone(),
         spawned: false,
         favorite: false,
         pinned: false,

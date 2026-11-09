@@ -1,0 +1,2 @@
+{"type":"user","uuid":"alice-shared","entrypoint":"cli","timestamp":"2026-01-01T00:00:01Z","cwd":"/home/alice/project","message":{"role":"user","content":"Synthetic parent request"}}
+{"type":"assistant","uuid":"alice-parent","entrypoint":"claude-desktop","timestamp":"2026-01-01T00:00:02Z","message":{"id":"alice-api-parent","role":"assistant","content":"Synthetic parent answer"}}

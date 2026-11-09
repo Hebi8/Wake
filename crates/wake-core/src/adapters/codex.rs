@@ -1125,9 +1125,14 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
             .map(|(_, _, usage)| usage.total())
             .sum()
     });
-    for (owner, fallback, usage) in response_usage_rows {
-        attach_usage(&mut messages, owner, usage);
-        attach_usage(&mut event_fallback, fallback, usage);
+    let (cut, cut_fallback) = inherited.unwrap_or((0, 0));
+    for (owner, fallback, usage) in response_usage_rows.into_iter().skip(inherited_usage_rows) {
+        attach_usage(&mut messages[cut..], owner.saturating_sub(cut), usage);
+        attach_usage(
+            &mut event_fallback[cut_fallback..],
+            fallback.saturating_sub(cut_fallback),
+            usage,
+        );
     }
     // fork 段先折叠再判 has_real:折完只剩一条 Meta 的子线程要走得到
     // event_msg 回退,与普通会话同一条路。回退流只截断、**不留标记**——

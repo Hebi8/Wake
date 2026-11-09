@@ -683,3 +683,127 @@ fn full_tool_input_and_usage_are_private_to_index_derivation() {
         .iter()
         .any(|f| f.path == "last.txt"));
 }
+
+#[test]
+fn codex_inherited_usage_without_parent_assistant_never_reaches_child() {
+    let rows = [
+        json!({"type":"session_meta","payload":{"cwd":"/home/alice/project","source":{"subagent":{"thread_spawn":{"agent_path":"/root/alice"}}}}}),
+        text("developer", "Synthetic instructions"),
+        text("user", "Parent request"),
+        count(source_usage(100, 20, 60), 120),
+        item(json!({"type":"agent_message","recipient":"/root/alice"})),
+        text("assistant", "Child answer"),
+        count(source_usage(50, 10, 20), 180),
+    ];
+    let t = parse("codex", &rows);
+    assert_eq!(usages(&t), [usage(30, 10, 20, None)]);
+    let s = indexed_codex(&rows);
+    assert_eq!(s.meta.tokens_used, Some(60));
+    assert_eq!(
+        s.structure
+            .iter()
+            .filter_map(|m| m.usage)
+            .map(TokenUsage::total)
+            .sum::<i64>(),
+        60
+    );
+}
+
+#[test]
+fn codex_child_encrypted_reasoning_usage_stays_after_the_fork() {
+    let rows = [
+        json!({"type":"session_meta","payload":{"cwd":"/home/alice/project","source":{"subagent":{"thread_spawn":{"agent_path":"/root/alice"}}}}}),
+        text("assistant", "Parent answer"),
+        count(source_usage(100, 20, 60), 120),
+        item(json!({"type":"agent_message","recipient":"/root/alice"})),
+        item(json!({"type":"reasoning","summary":[],"encrypted_content":"SYNTHETIC"})),
+        count(source_usage(50, 10, 20), 180),
+        text("assistant", "Child answer"),
+        count(source_usage(5, 1, 0), 186),
+    ];
+    let t = parse("codex", &rows);
+    assert_eq!(usages(&t), [usage(35, 11, 20, None)]);
+    let s = indexed_codex(&rows);
+    assert_eq!(s.meta.tokens_used, Some(66));
+    assert_eq!(
+        s.structure
+            .iter()
+            .filter_map(|m| m.usage)
+            .map(TokenUsage::total)
+            .sum::<i64>(),
+        66
+    );
+}
+
+#[test]
+fn unindexed_reasoning_and_wake_lookups_keep_their_usage_in_side_rows() {
+    for rows in [
+        vec![
+            thinking("Synthetic reasoning"),
+            count(source_usage(10, 2, 4), 12),
+            text("assistant", "Visible answer"),
+            count(source_usage(20, 3, 5), 35),
+        ],
+        vec![
+            text("assistant", "Visible answer"),
+            count(source_usage(10, 2, 4), 12),
+            thinking("Synthetic reasoning"),
+            count(source_usage(20, 3, 5), 35),
+        ],
+        vec![
+            item(
+                json!({"type":"function_call","name":"exec_command","call_id":"lookup","arguments":"{\"command\":\"wake-cli search synthetic\"}"}),
+            ),
+            count(source_usage(10, 2, 4), 12),
+            text("assistant", "Visible answer"),
+            count(source_usage(20, 3, 5), 35),
+        ],
+    ] {
+        let s = indexed_codex(&rows);
+        assert_eq!(s.units.len(), 1);
+        let total = s
+            .structure
+            .iter()
+            .filter_map(|m| m.usage)
+            .map(TokenUsage::total)
+            .sum::<i64>();
+        assert_eq!(Some(total), s.meta.tokens_used);
+        assert_eq!(total, 35);
+        assert_eq!(s.structure[0].usage, Some(usage(21, 5, 9, None)));
+    }
+}
+
+#[test]
+fn claude_source_is_first_owned_entrypoint_and_skips_inherited_prefix() {
+    let shared = fixture("claude_entrypoint.jsonl");
+    assert_eq!(parse("claude", &shared).meta.source.as_deref(), Some("cli"));
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("projects/-home-alice-project");
+    fs::create_dir_all(&project).unwrap();
+    let parent = project.join("alice-original.jsonl");
+    let child = project.join("alice-child.jsonl");
+    let mut original = vec![json!({"type":"queue-operation","timestamp":"2026-01-01T00:00:00Z"})];
+    original.extend(shared.clone());
+    write_rows(&parent, &original);
+    let mut fork = vec![json!({"type":"queue-operation","timestamp":"2026-01-02T00:00:00Z"})];
+    fork.extend(shared);
+    fork.push(json!({"type":"user","uuid":"alice-child-request","entrypoint":"sdk-ts","message":{"role":"user","content":"Synthetic child request"}}));
+    fork.push(json!({"type":"assistant","uuid":"alice-child-reply","entrypoint":"cli","message":{"id":"child-api","role":"assistant","content":"Synthetic child reply"}}));
+    write_rows(&child, &fork);
+    let adapter = adapter("claude", root.path());
+    let r = adapter.file_ref(&child).unwrap();
+    assert_eq!(
+        adapter.parse_session(&r).unwrap().meta.source.as_deref(),
+        Some("sdk-ts")
+    );
+    assert_eq!(
+        adapter.parse_transcript(&r).unwrap().meta.source.as_deref(),
+        Some("sdk-ts")
+    );
+    assert_eq!(
+        parse("claude", &[claude(None, "No entrypoint", Value::Null)])
+            .meta
+            .source,
+        None
+    );
+}

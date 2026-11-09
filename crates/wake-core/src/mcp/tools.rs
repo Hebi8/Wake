@@ -669,12 +669,18 @@ fn scope_note(
     }
 }
 
+// Claude entrypoint is newly indexed for downstream consumers. Keep the
+// established CLI/MCP text unchanged while retaining it in sessions.source.
+fn source_tag(agent: AgentId, source: Option<&str>) -> Option<&str> {
+    source.filter(|s| agent != AgentId::ClaudeCode && !s.is_empty())
+}
+
 fn session_line(s: &SessionMeta) -> String {
     let mut tags = Vec::new();
     if !s.host.is_empty() {
         tags.push(format!("@{}", s.host));
     }
-    if let Some(src) = s.source.as_deref().filter(|v| !v.is_empty()) {
+    if let Some(src) = source_tag(s.agent, s.source.as_deref()) {
         tags.push(format!("via {src}"));
     }
     if s.favorite {
@@ -1414,7 +1420,7 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
     if let Some(m) = live.model.as_deref().filter(|m| !m.is_empty()) {
         facts.push(format!("model: {m}"));
     }
-    if let Some(src) = meta.source.as_deref().filter(|v| !v.is_empty()) {
+    if let Some(src) = source_tag(meta.agent, meta.source.as_deref()) {
         facts.push(format!("via {src}"));
     }
     // 时间范围:主线用会话的起止,子代理用它自己消息的首末时间(没有就不写)
@@ -1541,6 +1547,18 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claude_entrypoint_does_not_add_a_cli_source_tag() {
+        assert_eq!(
+            super::source_tag(crate::models::AgentId::ClaudeCode, Some("sdk-ts")),
+            None
+        );
+        assert_eq!(
+            super::source_tag(crate::models::AgentId::Codex, Some("IDE")),
+            Some("IDE")
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -1,4 +1,4 @@
-//! File operands from explicit file tools, before their inputs are clipped.
+//! File operands from explicit file tools and static code-mode apply_patch calls.
 use crate::models::{AgentId, ToolCallView, ToolFile};
 use serde_json::Value;
 
@@ -14,6 +14,11 @@ pub(super) fn from_call(
     let value = serde_json::from_str::<Value>(input).ok();
     let mut paths = Vec::new();
     match call.name.as_str() {
+        "exec" if agent == AgentId::Codex && input.contains("apply_patch") => {
+            for patch in exec_patches(value.as_ref().and_then(Value::as_str).unwrap_or(input)) {
+                patch_paths(&patch, &mut paths);
+            }
+        }
         "apply_patch" => patch_paths(
             value.as_ref().and_then(Value::as_str).unwrap_or(input),
             &mut paths,
@@ -70,6 +75,343 @@ pub(super) fn from_call(
         }
     }
     files
+}
+
+// Code-mode inputs are JavaScript, not shell commands. Read only static strings
+// and bindings; opaque expressions stand for patch bodies, never guessed paths.
+#[derive(Clone, Copy, PartialEq)]
+enum JsToken<'a> {
+    Word(&'a str),
+    Literal(&'a str),
+    Punct(char),
+}
+
+#[derive(Clone)]
+enum JsValue {
+    Text(String),
+    Array(Vec<JsValue>),
+    Object(Vec<(String, JsValue)>),
+}
+
+fn js_tokens(code: &str) -> Vec<JsToken<'_>> {
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < code.len() {
+        let rest = &code[i..];
+        let c = rest.chars().next().unwrap();
+        if c.is_whitespace() {
+            i += c.len_utf8();
+            continue;
+        }
+        if rest.starts_with("//") {
+            i += rest.find('\n').unwrap_or(rest.len());
+            continue;
+        }
+        if rest.starts_with("/*") {
+            i += rest.find("*/").map_or(rest.len(), |n| n + 2);
+            continue;
+        }
+        if matches!(c, '\'' | '"' | '`') {
+            let start = i;
+            i += 1;
+            while i < code.len() {
+                let next = code[i..].chars().next().unwrap();
+                i += next.len_utf8();
+                if next == '\\' {
+                    if let Some(escaped) = code[i..].chars().next() {
+                        i += escaped.len_utf8();
+                    }
+                } else if next == c {
+                    break;
+                }
+            }
+            tokens.push(JsToken::Literal(&code[start..i]));
+        } else if c.is_ascii_alphanumeric() || matches!(c, '_' | '$') {
+            let end = rest
+                .find(|x: char| !x.is_ascii_alphanumeric() && x != '_' && x != '$')
+                .unwrap_or(rest.len());
+            tokens.push(JsToken::Word(&rest[..end]));
+            i += end;
+        } else {
+            tokens.push(JsToken::Punct(c));
+            i += c.len_utf8();
+        }
+    }
+    tokens
+}
+
+type JsBindings<'a> = std::collections::HashMap<&'a str, JsValue>;
+
+fn js_literal(raw: &str, bindings: &JsBindings<'_>) -> Option<String> {
+    let quote = raw.chars().next()?;
+    let body = raw.strip_prefix(quote)?.strip_suffix(quote)?;
+    let mut chars = body.chars().peekable();
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next()? {
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'b' => out.push('\u{8}'),
+                'f' => out.push('\u{c}'),
+                'v' => out.push('\u{b}'),
+                '0' => out.push('\0'),
+                '\n' => {}
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                }
+                escape @ ('u' | 'x') => {
+                    let braced = escape == 'u' && chars.peek() == Some(&'{');
+                    let digits: String = if braced {
+                        chars.next();
+                        chars.by_ref().take_while(|c| *c != '}').collect()
+                    } else {
+                        chars
+                            .by_ref()
+                            .take(if escape == 'u' { 4 } else { 2 })
+                            .collect()
+                    };
+                    let mut scalar = u32::from_str_radix(&digits, 16).ok()?;
+                    if (0xd800..=0xdbff).contains(&scalar) {
+                        if chars.next()? != '\\' || chars.next()? != 'u' {
+                            return None;
+                        }
+                        let low =
+                            u32::from_str_radix(&chars.by_ref().take(4).collect::<String>(), 16)
+                                .ok()?;
+                        scalar = 0x10000 + ((scalar - 0xd800) << 10) + low.checked_sub(0xdc00)?;
+                    }
+                    out.push(char::from_u32(scalar)?);
+                }
+                other => out.push(other),
+            }
+        } else if quote == '`' && c == '$' && chars.peek() == Some(&'{') {
+            chars.next();
+            let name: String = chars.by_ref().take_while(|c| *c != '}').collect();
+            match bindings.get(name.trim()) {
+                Some(JsValue::Text(value)) => out.push_str(value),
+                _ => out.push('\0'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+// Split only at the current expression level, leaving calls and arrays opaque.
+fn js_split<'a>(tokens: &'a [JsToken<'a>], separator: char) -> Vec<&'a [JsToken<'a>]> {
+    let (mut depth, mut start) = (0i32, 0);
+    let mut parts = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
+            JsToken::Punct(c) if *c == separator && depth == 0 => {
+                parts.push(&tokens[start..i]);
+                start = i + 1;
+            }
+            JsToken::Punct('(' | '[' | '{') => depth += 1,
+            JsToken::Punct(')' | ']' | '}') => depth -= 1,
+            _ => {}
+        }
+    }
+    parts.push(&tokens[start..]);
+    parts
+}
+
+fn js_value(tokens: &[JsToken<'_>], bindings: &JsBindings<'_>) -> JsValue {
+    let parts = js_split(tokens, '+');
+    if parts.len() > 1 {
+        let mut text = String::new();
+        for part in parts {
+            match js_value(part, bindings) {
+                JsValue::Text(value) => text.push_str(&value),
+                _ => text.push('\0'),
+            }
+        }
+        return JsValue::Text(text);
+    }
+    if let [base @ .., JsToken::Punct('.'), JsToken::Word("join"), JsToken::Punct('('), JsToken::Literal(separator), JsToken::Punct(')')] =
+        tokens
+    {
+        if let (JsValue::Array(parts), Some(separator)) =
+            (js_value(base, bindings), js_literal(separator, bindings))
+        {
+            let strings: Vec<_> = parts
+                .into_iter()
+                .map(|value| match value {
+                    JsValue::Text(s) => s,
+                    _ => "\0".into(),
+                })
+                .collect();
+            return JsValue::Text(strings.join(&separator));
+        }
+    }
+    if let [JsToken::Word("Object"), JsToken::Punct('.'), JsToken::Word("entries"), JsToken::Punct('('), inner @ .., JsToken::Punct(')')] =
+        tokens
+    {
+        if let JsValue::Object(entries) = js_value(inner, bindings) {
+            return JsValue::Array(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| JsValue::Array(vec![JsValue::Text(key), value]))
+                    .collect(),
+            );
+        }
+    }
+    match tokens {
+        [JsToken::Literal(raw)] => {
+            JsValue::Text(js_literal(raw, bindings).unwrap_or_else(|| "\0".into()))
+        }
+        [JsToken::Word(name)] => bindings
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| JsValue::Text("\0".into())),
+        [JsToken::Punct('['), inner @ .., JsToken::Punct(']')] => JsValue::Array(
+            js_split(inner, ',')
+                .into_iter()
+                .filter(|p| !p.is_empty())
+                .map(|part| js_value(part, bindings))
+                .collect(),
+        ),
+        [JsToken::Punct('{'), inner @ .., JsToken::Punct('}')] => {
+            let entries = js_split(inner, ',')
+                .into_iter()
+                .filter_map(|part| {
+                    let [key, JsToken::Punct(':'), value @ ..] = part else {
+                        return None;
+                    };
+                    let key = match key {
+                        JsToken::Literal(raw) => js_literal(raw, bindings)?,
+                        JsToken::Word(name) => (*name).to_owned(),
+                        _ => return None,
+                    };
+                    Some((key, js_value(value, bindings)))
+                })
+                .collect();
+            JsValue::Object(entries)
+        }
+        _ => JsValue::Text("\0".into()),
+    }
+}
+
+fn js_end(tokens: &[JsToken<'_>], start: usize, statement: bool) -> usize {
+    let mut depth = 0;
+    for (i, token) in tokens.iter().enumerate().skip(start) {
+        match token {
+            JsToken::Punct(')' | ']' | '}') if depth == 0 => return i,
+            JsToken::Punct(',' | ';') if depth == 0 && statement => return i,
+            JsToken::Punct('(' | '[' | '{') => depth += 1,
+            JsToken::Punct(')' | ']' | '}') => depth -= 1,
+            _ => {}
+        }
+    }
+    tokens.len()
+}
+
+fn js_patch_calls<'a>(
+    tokens: &[JsToken<'a>],
+    bindings: &mut JsBindings<'a>,
+    patches: &mut Vec<String>,
+) {
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens.get(i..i + 2) == Some(&[JsToken::Word("for"), JsToken::Punct('(')]) {
+            let end = js_end(tokens, i + 2, true);
+            if let Some(of) = tokens[i + 2..end]
+                .iter()
+                .position(|t| *t == JsToken::Word("of"))
+            {
+                let of = i + 2 + of;
+                let names: Vec<_> = tokens[i + 2..of]
+                    .iter()
+                    .filter_map(|t| match t {
+                        JsToken::Word(name) if !matches!(*name, "const" | "let" | "var") => {
+                            Some(*name)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if let JsValue::Array(values) = js_value(&tokens[of + 1..end], bindings) {
+                    let braced = tokens.get(end + 1) == Some(&JsToken::Punct('{'));
+                    let start = end + if braced { 2 } else { 1 };
+                    let finish = js_end(tokens, start, !braced);
+                    for value in values {
+                        let mut local = bindings.clone();
+                        let values = if names.len() == 1 {
+                            vec![value]
+                        } else if let JsValue::Array(values) = value {
+                            values
+                        } else {
+                            Vec::new()
+                        };
+                        for (name, value) in names.iter().zip(values) {
+                            local.insert(name, value);
+                        }
+                        js_patch_calls(&tokens[start..finish], &mut local, patches);
+                        for (name, value) in bindings
+                            .iter_mut()
+                            .filter(|(name, _)| !names.contains(name))
+                        {
+                            if let Some(updated) = local.get(name) {
+                                *value = updated.clone();
+                            }
+                        }
+                    }
+                    i = finish + 1;
+                    continue;
+                }
+            }
+        }
+        if let (Some(JsToken::Word(name)), Some(JsToken::Punct('+')), Some(JsToken::Punct('='))) =
+            (tokens.get(i), tokens.get(i + 1), tokens.get(i + 2))
+        {
+            let end = js_end(tokens, i + 3, true);
+            let value = js_value(&tokens[i + 3..end], bindings);
+            if let (Some(JsValue::Text(left)), JsValue::Text(right)) =
+                (bindings.get_mut(name), value)
+            {
+                left.push_str(&right);
+            }
+        }
+        if let (Some(JsToken::Word(name)), Some(JsToken::Punct('='))) =
+            (tokens.get(i), tokens.get(i + 1))
+        {
+            if tokens.get(i + 2) != Some(&JsToken::Punct('=')) {
+                let end = js_end(tokens, i + 2, true);
+                bindings.insert(name, js_value(&tokens[i + 2..end], bindings));
+            }
+        }
+        if tokens.get(i..i + 4)
+            == Some(&[
+                JsToken::Word("tools"),
+                JsToken::Punct('.'),
+                JsToken::Word("apply_patch"),
+                JsToken::Punct('('),
+            ])
+        {
+            let end = js_end(tokens, i + 4, true);
+            if let JsValue::Text(patch) = js_value(&tokens[i + 4..end], bindings) {
+                // Dynamic body expressions do not affect file headers. A dynamic
+                // header itself cannot identify a file, so do not invent a path.
+                if !patch
+                    .lines()
+                    .any(|line| line.starts_with("*** ") && line.contains('\0'))
+                {
+                    patches.push(patch);
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+fn exec_patches(code: &str) -> Vec<String> {
+    let mut patches = Vec::new();
+    js_patch_calls(&js_tokens(code), &mut JsBindings::new(), &mut patches);
+    patches
 }
 
 fn field<'a>(value: Option<&'a Value>, names: &[&str]) -> Option<&'a str> {
@@ -385,5 +727,83 @@ mod tests {
                 }]
             );
         }
+    }
+    #[test]
+    fn code_mode_patches_support_literals_bindings_templates_and_batches() {
+        let code = r#"
+            const file = "template.rs";
+            const a = "*** Begin Patch\n*** Add File: first.rs\n+x\n*** End Patch";
+            const b = `*** Begin Patch
+*** Update File: ${file}
+@@
+-a
++b
+*** End Patch`;
+            for (const patch of [a, b]) { const ignored = 1; text(await tools.apply_patch(patch)); }
+            tools.apply_patch('*** Begin Patch\n*** Delete File: old.rs\n*** End Patch');
+            // tools.apply_patch("*** Begin Patch\n*** Add File: comment.rs\n+x\n*** End Patch")
+            const example = "tools.apply_patch(\"*** Add File: example.rs\")";
+        "#;
+        let files = files(AgentId::Codex, "exec", json!(code));
+        assert_eq!(
+            files
+                .iter()
+                .map(|f| (f.path.as_str(), f.op))
+                .collect::<Vec<_>>(),
+            [
+                ("/home/alice/project/first.rs", "change"),
+                ("/home/alice/project/template.rs", "change"),
+                ("/home/alice/project/old.rs", "delete"),
+            ]
+        );
+    }
+
+    #[test]
+    fn code_mode_static_headers_survive_dynamic_body_expressions() {
+        let code = r#"
+            const patch = "*** Begin Patch\n*** Add File: generated.rs\n" + content.split("\n").map(line => "+" + line).join("\n") + "\n*** End Patch";
+            tools.apply_patch(patch);
+            tools.apply_patch("*** Begin Patch\n*** Add File: " + unknownPath + "\n+x\n*** End Patch");
+        "#;
+        let found = files(AgentId::Codex, "exec", json!(code));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, "/home/alice/project/generated.rs");
+    }
+
+    #[test]
+    fn code_mode_string_escapes_preserve_file_names() {
+        let code = r#"tools.apply_patch("*** Begin Patch\n*** Add File: \u0061\"b\\c.rs\n+x\n*** End Patch");"#;
+        let found = files(AgentId::Codex, "exec", json!(code));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, "/home/alice/project/a\"b\\c.rs");
+    }
+    #[test]
+    fn code_mode_array_join_keeps_static_headers_around_generated_lines() {
+        let code = r#"const files = ["a.rs", "b.rs"];
+            for (const file of files) {
+                const patch = ["*** Begin Patch", `*** Update File: ${file}`, "@@", ...lines.map(l => "+" + l), "*** End Patch"].join("\n");
+                tools.apply_patch(patch);
+            }"#;
+        let found = files(AgentId::Codex, "exec", json!(code));
+        assert_eq!(
+            found.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            ["/home/alice/project/a.rs", "/home/alice/project/b.rs"]
+        );
+    }
+    #[test]
+    fn code_mode_builders_accumulate_headers_over_static_file_sets() {
+        let code = r#"const changes = {"a.rs": replacementA, "b.rs": replacementB};
+            let patch = "*** Begin Patch\n";
+            for (const [file, change] of Object.entries(changes)) {
+                patch += `*** Update File: ${file}\n@@\n`;
+                patch += change.map(line => "+" + line).join("\n") + "\n";
+            }
+            patch += "*** End Patch";
+            tools.apply_patch(patch);"#;
+        let found = files(AgentId::Codex, "exec", json!(code));
+        assert_eq!(
+            found.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            ["/home/alice/project/a.rs", "/home/alice/project/b.rs"]
+        );
     }
 }
