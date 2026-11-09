@@ -1,7 +1,6 @@
 //! File operands from explicit file tools, before their inputs are clipped.
 use crate::models::{AgentId, ToolCallView, ToolFile};
 use serde_json::Value;
-use std::path::{Component, Path, PathBuf};
 
 pub(super) fn from_call(
     agent: AgentId,
@@ -113,22 +112,50 @@ fn resolve(path: &str, cwd: &str) -> String {
     if cwd.is_empty() {
         return path.to_owned();
     }
-    let joined = Path::new(cwd).join(path);
-    let mut clean = PathBuf::new();
-    for component in joined.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if matches!(clean.components().next_back(), Some(Component::Normal(_))) {
-                    clean.pop();
-                } else if !clean.has_root() {
-                    clean.push(component);
-                }
+    // Transcripts can come from another OS. Interpret the source path syntax,
+    // not the host's Path::components rules (notably POSIX paths on Windows).
+    let windows_drive =
+        |s: &str| matches!(s.as_bytes(), [d, b':', b'/' | b'\\', ..] if d.is_ascii_alphabetic());
+    let windows = windows_drive(path)
+        || path.starts_with("\\\\")
+        || (!path.starts_with('/') && (windows_drive(cwd) || cwd.starts_with("\\\\")));
+    let (path, cwd) = if windows {
+        (path.replace('\\', "/"), cwd.replace('\\', "/"))
+    } else {
+        (path.to_owned(), cwd.to_owned())
+    };
+    let joined = if path.starts_with('/') || windows_drive(&path) {
+        path
+    } else {
+        format!("{cwd}/{path}")
+    };
+    let (prefix, rest, floor) = if windows_drive(&joined) {
+        (format!("{}/", &joined[..2]), &joined[3..], 0)
+    } else if windows && joined.starts_with("//") {
+        ("//".to_owned(), &joined[2..], 2)
+    } else if let Some(rest) = joined.strip_prefix('/') {
+        ("/".to_owned(), rest, 0)
+    } else {
+        (String::new(), joined.as_str(), 0)
+    };
+    let mut parts = Vec::new();
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." if parts.len() > floor && parts.last() != Some(&"..") => {
+                parts.pop();
             }
-            _ => clean.push(component),
+            ".." if prefix.is_empty() => parts.push(part),
+            ".." => {}
+            _ => parts.push(part),
         }
     }
-    clean.to_string_lossy().into_owned()
+    let result = format!("{prefix}{}", parts.join("/"));
+    if windows {
+        result.replace('/', "\\")
+    } else {
+        result
+    }
 }
 
 #[cfg(test)]
@@ -257,6 +284,21 @@ mod tests {
         assert_eq!(
             resolve("../file.rs", "/home/alice/project"),
             "/home/alice/file.rs"
+        );
+    }
+    #[test]
+    fn source_windows_paths_are_resolved_on_any_host() {
+        assert_eq!(
+            resolve(r"src\..\file.rs", r"C:\Users\alice\project"),
+            r"C:\Users\alice\project\file.rs"
+        );
+        assert_eq!(
+            resolve(r"D:\files\..\file.rs", r"C:\Users\alice"),
+            r"D:\file.rs"
+        );
+        assert_eq!(
+            resolve(r"..\file.rs", r"\\server\share\project"),
+            r"\\server\share\file.rs"
         );
     }
 }
