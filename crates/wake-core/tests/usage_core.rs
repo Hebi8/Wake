@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 use wake_core::adapters::{claude::ClaudeAdapter, codex::CodexAdapter, AgentAdapter};
-use wake_core::models::{MessageKind, ParsedTranscript, Role, TokenUsage};
+use wake_core::models::{MessageKind, ParsedTranscript, TokenUsage};
 
 fn write_rows(path: &Path, rows: &[Value]) {
     fs::write(
@@ -29,6 +29,16 @@ fn parse(agent: &str, rows: &[Value]) -> ParsedTranscript {
     assert_eq!(indexed.meta.tokens_used, transcript.meta.tokens_used);
     assert_eq!(transcript.unknown_line_count, 0);
     transcript
+}
+
+fn indexed_codex(rows: &[Value]) -> wake_core::models::ParsedSession {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("rollout-alice.jsonl");
+    write_rows(&path, rows);
+    let adapter = adapter("codex", root.path());
+    adapter
+        .parse_session(&adapter.file_ref(&path).unwrap())
+        .unwrap()
 }
 
 fn adapter(agent: &str, root: &Path) -> Box<dyn AgentAdapter> {
@@ -73,11 +83,11 @@ fn claude(id: Option<&str>, text: &str, usage: Value) -> Value {
 }
 
 #[test]
-fn claude_three_blocks_have_one_usage_and_four_component_total() {
+fn claude_three_blocks_keep_cache_read_separate_from_session_total() {
     let t = parse("claude", &fixture("claude_three_blocks.jsonl"));
     assert_eq!(t.mainline.len(), 1);
     assert_eq!(usages(&t), [usage(100, 20, 300, Some(40))]);
-    assert_eq!(t.meta.tokens_used, Some(460));
+    assert_eq!(t.meta.tokens_used, Some(160));
     assert!(t.mainline[0].thinking.is_some());
     assert_eq!(t.mainline[0].tool_calls.len(), 1);
 }
@@ -86,7 +96,7 @@ fn claude_three_blocks_have_one_usage_and_four_component_total() {
 fn claude_differing_usage_uses_last_snapshot_not_maxima() {
     let t = parse("claude", &fixture("claude_last_wins.jsonl"));
     assert_eq!(usages(&t), [usage(90, 5, 200, Some(10))]);
-    assert_eq!(t.meta.tokens_used, Some(305));
+    assert_eq!(t.meta.tokens_used, Some(105));
 }
 
 #[test]
@@ -164,7 +174,7 @@ fn claude_usage_only_and_unknown_fields_are_preserved() {
             claude(Some("b"), "No usage", Value::Null),
         ],
     );
-    assert_eq!(t.mainline.len(), 2);
+    assert_eq!(t.mainline.len(), 1);
     assert_eq!(
         usages(&t),
         [TokenUsage {
@@ -348,7 +358,7 @@ fn codex_current_records_and_legacy_stream_are_not_double_counted() {
 }
 
 #[test]
-fn codex_current_records_retain_usage_only_responses() {
+fn codex_usage_only_source_keeps_total_without_display_rows() {
     let t = parse(
         "codex",
         &[
@@ -356,15 +366,8 @@ fn codex_current_records_retain_usage_only_responses() {
             current("r2", source_usage(100, 20, 60), 240),
         ],
     );
-    assert_eq!(t.mainline.len(), 2);
-    assert!(t
-        .mainline
-        .iter()
-        .all(|m| m.role == Role::Assistant && m.text.is_empty()));
-    assert_eq!(
-        usages(&t),
-        [usage(40, 20, 60, None), usage(40, 20, 60, None)]
-    );
+    assert!(t.mainline.is_empty());
+    assert!(usages(&t).is_empty());
     assert_eq!(t.meta.tokens_used, Some(240));
 }
 
@@ -467,25 +470,22 @@ fn codex_process_status_accepts_only_structured_fields_and_result_headers() {
     let cases = [
         (json!({"output":"sample","metadata":{"exit_code":2}}),true),
         (json!({"output":"error text","metadata":{"exit_code":0}}),false),
-        (json!({"output":"sample","exit_code":-1}),true),
-        (json!({"output":"error text","exit_code":0}),false),
+
+
         (json!("{\"output\":\"sample\",\"metadata\":{\"exit_code\":3}}"),true),
         (json!("Chunk ID: sample\nWall time: 0.1 seconds\nProcess exited with code 1\nOutput:\nsample"),true),
         (json!("Wall time: 0.1 seconds\nExit code: 0\nOutput:\nProcess exited with code 1"),false),
-        (json!({"content":[{"type":"text","text":"Wall time: 0.1 seconds\nProcess exited with code 2\nOutput:\nsample"}]}),true),
+
         (json!("Wall time: 0.1 seconds\nProcess running with session ID 42\nOutput:\nProcess exited with code 1"),false),
         (json!("error: exit code 1"),false),
         (json!("Process exited with code 1"),false),
     ];
     for (output, is_error) in cases {
-        let t = parse(
-            "codex",
-            &[
-                call("exec"),
-                item(json!({"type":"function_call_output","call_id":"exec","output":output})),
-            ],
-        );
-        assert_eq!(t.mainline[0].tool_calls[0].is_error, is_error, "{output}");
+        let t = indexed_codex(&[
+            call("exec"),
+            item(json!({"type":"function_call_output","call_id":"exec","output":output})),
+        ]);
+        assert_eq!(t.structure[0].tool_calls[0].is_error, is_error, "{output}");
     }
 }
 
@@ -499,7 +499,7 @@ fn codex_full_raw_input_reaches_derive() {
         )],
     );
     assert_eq!(
-        t.mainline[0].tool_calls[0].input.as_deref(),
+        t.mainline[0].tool_calls[0].full_input.as_deref(),
         Some(patch.as_str())
     );
 }
@@ -527,13 +527,9 @@ fn codex_usage_only_current_record_after_legacy_is_a_distinct_response() {
             count(source_usage(50, 10, 20), 180),
         ],
     );
-    assert_eq!(t.mainline.len(), 2);
+    assert_eq!(t.mainline.len(), 1);
     assert_eq!(t.mainline[0].text, "First");
-    assert!(t.mainline[1].text.is_empty());
-    assert_eq!(
-        usages(&t),
-        [usage(40, 20, 60, None), usage(30, 10, 20, None)]
-    );
+    assert_eq!(usages(&t), [usage(70, 30, 80, None)]);
 }
 
 #[test]
@@ -561,13 +557,13 @@ fn codex_current_zero_usage_is_known_zero() {
             count(source_usage(0, 0, 0), 0),
         ],
     );
-    assert_eq!(t.mainline.len(), 1);
-    assert_eq!(usages(&t), [usage(0, 0, 0, None)]);
+    assert!(t.mainline.is_empty());
+    assert!(usages(&t).is_empty());
     assert_eq!(t.meta.tokens_used, Some(0));
 }
 
 #[test]
-fn codex_current_and_legacy_usage_only_responses_do_not_reuse_tool_hosts() {
+fn codex_responses_keep_the_original_shared_tool_host() {
     let t = parse(
         "codex",
         &[
@@ -579,11 +575,11 @@ fn codex_current_and_legacy_usage_only_responses_do_not_reuse_tool_hosts() {
             count(source_usage(50, 10, 20), 240),
         ],
     );
-    assert_eq!(t.mainline.len(), 3);
+    assert_eq!(t.mainline.len(), 1);
+    assert_eq!(t.mainline[0].tool_calls.len(), 2);
     assert_eq!(t.mainline[0].tool_calls[0].id, "first");
-    assert!(t.mainline[1].tool_calls.is_empty());
-    assert_eq!(t.mainline[2].tool_calls[0].id, "next");
-    assert_eq!(usages(&t).len(), 3);
+    assert_eq!(t.mainline[0].tool_calls[1].id, "next");
+    assert_eq!(usages(&t), [usage(100, 40, 100, None)]);
 }
 
 #[test]
@@ -613,4 +609,77 @@ fn codex_fork_with_only_inherited_usage_has_zero_owned_tokens() {
     );
     assert!(usages(&t).is_empty());
     assert_eq!(t.meta.tokens_used, Some(0));
+}
+
+#[test]
+fn codex_response_replay_after_count_replaces_usage_without_splitting_display() {
+    let t = parse(
+        "codex",
+        &[
+            text("assistant", "Working."),
+            call("first"),
+            current("r1", source_usage(100, 20, 60), 120),
+            count(source_usage(100, 20, 60), 120),
+            current("r1", source_usage(110, 20, 60), 130),
+            count(source_usage(110, 20, 60), 130),
+            call("second"),
+            current("r2", source_usage(10, 2, 0), 142),
+            count(source_usage(10, 2, 0), 142),
+        ],
+    );
+    assert_eq!(t.mainline.len(), 1);
+    assert_eq!(t.mainline[0].tool_calls.len(), 2);
+    assert_eq!(usages(&t), [usage(60, 22, 60, None)]);
+    assert_eq!(t.meta.tokens_used, Some(142));
+}
+
+#[test]
+fn codex_code_mode_errors_use_only_the_outer_script_status() {
+    for name in ["exec", "wait"] {
+        for (status, nested, expected) in
+            [("Script completed", 1, false), ("Script failed", 0, true)]
+        {
+            let rows = [
+                item(json!({"type":"function_call","name":name,"call_id":"code","arguments":"{}"})),
+                item(
+                    json!({"type":"function_call_output","call_id":"code","output":[
+                        {"type":"text","text":status},
+                        {"type":"text","text":format!("Wall time: 0.1 seconds\nProcess exited with code {nested}\nOutput:\nSynthetic output")}
+                    ]}),
+                ),
+            ];
+            assert_eq!(
+                indexed_codex(&rows).structure[0].tool_calls[0].is_error,
+                expected
+            );
+            assert!(!parse("codex", &rows).mainline[0].tool_calls[0].is_error);
+        }
+    }
+}
+
+#[test]
+fn full_tool_input_and_usage_are_private_to_index_derivation() {
+    let patch = format!(
+        "*** Begin Patch\n*** Add File: first.txt\n+{}\n*** Add File: last.txt\n+x\n*** End Patch",
+        "x".repeat(20_000)
+    );
+    let rows = [
+        item(
+            json!({"type":"custom_tool_call","name":"apply_patch","call_id":"patch","input":patch}),
+        ),
+        current("r1", source_usage(10, 2, 0), 12),
+    ];
+    let t = parse("codex", &rows);
+    let call = &t.mainline[0].tool_calls[0];
+    assert!(call.input.as_ref().unwrap().ends_with("… (truncated)"));
+    assert_eq!(call.full_input.as_deref(), Some(patch.as_str()));
+    let serialized = serde_json::to_value(&t.mainline[0]).unwrap();
+    assert!(serialized.get("usage").is_none());
+    assert!(serialized["tool_calls"][0].get("full_input").is_none());
+    let indexed = indexed_codex(&rows);
+    assert!(indexed.structure[0].tool_calls[0].full_input.is_none());
+    assert!(indexed.structure[0]
+        .tool_files
+        .iter()
+        .any(|f| f.path == "last.txt"));
 }

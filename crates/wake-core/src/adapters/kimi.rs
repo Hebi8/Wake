@@ -124,10 +124,11 @@ impl KimiAdapter {
             },
             (None, None) => KimiState::default(),
         };
-        let (messages, unknown) = parse_kimi_wire(path, decode_images)?;
+        let (messages, unknown, tokens) = parse_kimi_wire(path, decode_images)?;
         // 子代理的工作目录跟着所在会话(索引按会话记)
         let session = subagent_session_id(path).unwrap_or_else(|| r.native_id.clone());
         let mut meta = build_meta(r, &state, &self.cwd_for(&session), &messages);
+        meta.tokens_used = tokens;
         if subagent.is_some() {
             // 时间按它自己的消息算
             meta.spawned = true;
@@ -404,6 +405,8 @@ struct WireReader {
     /// 关上它。用户消息、压缩摘要与新的一轮(turn.* 里除了 turn.step.*)关上它——输入渲染
     /// 不出来的那一轮没有用户消息隔开,也不能并进上一轮
     reply_open: bool,
+    usage_rows: Vec<(usize, TokenUsage)>,
+    tokens_used: Option<i64>,
     /// 已显示、回声(context.append_message 里的同一份输入)还没到的用户输入数
     pending_echo: u32,
     /// toolCallId → (消息下标, 调用下标),工具结果回填用
@@ -469,8 +472,13 @@ impl WireReader {
                     })
                     .filter(|u| *u != TokenUsage::default());
                 if let Some(usage) = usage {
-                    let ix = self.reply(ts);
-                    self.messages[ix].usage.get_or_insert_default().add(usage);
+                    self.tokens_used = Some(self.tokens_used.unwrap_or(0) + usage.new_tokens());
+                    let anchor = if self.reply_open {
+                        self.messages.len() - 1
+                    } else {
+                        self.messages.len()
+                    };
+                    self.usage_rows.push((anchor, usage));
                 }
             }
             "context.apply_compaction" => {
@@ -484,6 +492,7 @@ impl WireReader {
             }
             // 分叉:Kimi 把父会话的记录原样复制过来,再补这一行(多次分叉以最后一个为准)
             "forked" => {
+                self.tokens_used = None;
                 self.inherited = self.messages.len();
                 self.reply_open = false;
                 self.pending_echo = 0;
@@ -637,14 +646,26 @@ impl WireReader {
         }
     }
 
-    fn finish(mut self) -> (Vec<TranscriptMessage>, u32) {
+    fn finish(mut self) -> (Vec<TranscriptMessage>, u32, Option<i64>) {
+        for (anchor, usage) in self.usage_rows {
+            if anchor >= self.inherited {
+                attach_usage(
+                    &mut self.messages[self.inherited..],
+                    anchor - self.inherited,
+                    usage,
+                );
+            }
+        }
         collapse_inherited(&mut self.messages, self.inherited, "session");
         assign_seq(&mut self.messages);
-        (self.messages, self.unknown)
+        (self.messages, self.unknown, self.tokens_used)
     }
 }
 
-fn parse_kimi_wire(path: &Path, decode_images: bool) -> Result<(Vec<TranscriptMessage>, u32)> {
+fn parse_kimi_wire(
+    path: &Path,
+    decode_images: bool,
+) -> Result<(Vec<TranscriptMessage>, u32, Option<i64>)> {
     let _image_budget = transcript_image_decode_budget(decode_images);
     let reader = BufReader::with_capacity(1 << 20, fs::File::open(path)?);
     let mut wire = WireReader {
@@ -746,11 +767,7 @@ fn build_meta(
         size_bytes: r.size,
         git_branch: None,
         model: None,
-        tokens_used: messages
-            .iter()
-            .filter_map(|m| m.usage)
-            .map(TokenUsage::total)
-            .reduce(|a, b| a + b),
+        tokens_used: None,
         archived: state.archived,
         source: None,
         spawned: false,

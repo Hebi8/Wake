@@ -28,6 +28,7 @@ pub(crate) struct PiRender {
     decode_images: bool,
     /// toolCallId → (消息下标, tool_calls 下标)
     tool_index: HashMap<String, (usize, usize)>,
+    pending_usage: Option<TokenUsage>,
 }
 
 impl PiRender {
@@ -39,6 +40,7 @@ impl PiRender {
             opts,
             decode_images,
             tool_index: HashMap::new(),
+            pending_usage: None,
         }
     }
 
@@ -140,8 +142,19 @@ impl PiRender {
             && tools.is_empty()
             && parsed.images.is_empty()
             && thinking.is_empty()
-            && usage.is_none()
         {
+            if let Some(usage) = usage {
+                if let Some(last) = self
+                    .messages
+                    .iter_mut()
+                    .rev()
+                    .find(|m| m.role == Role::Assistant && m.kind == MessageKind::Text)
+                {
+                    last.usage.get_or_insert_default().add(usage);
+                } else {
+                    self.pending_usage.get_or_insert_default().add(usage);
+                }
+            }
             return;
         }
         let model = msg.get("model").and_then(Value::as_str).map(String::from);
@@ -151,6 +164,9 @@ impl PiRender {
         // 连续 assistant(中间只隔 toolResult)合并成一条,详情页每个回合一条助手消息
         let base = merge_into_last_assistant(&mut self.messages, ts, parsed, &thinking);
         let last = &mut self.messages[base];
+        if let Some(usage) = self.pending_usage.take() {
+            last.usage.get_or_insert_default().add(usage);
+        }
         if let Some(usage) = usage {
             last.usage.get_or_insert_default().add(usage);
         }

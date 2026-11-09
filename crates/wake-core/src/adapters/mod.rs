@@ -679,7 +679,7 @@ fn units_from_messages(messages: &[TranscriptMessage]) -> Vec<IndexUnit> {
                 parts.push(format!("{} {}", tc.name, tc.input_preview));
             }
             let text = parse_utils::clip(&parts.join("\n"), MAX_MSG_TEXT).0;
-            if text.trim().is_empty() && m.usage.is_none() {
+            if text.trim().is_empty() {
                 None
             } else {
                 Some(IndexUnit {
@@ -760,10 +760,7 @@ impl ParsedSession {
                     .collect();
                 let mut tool_calls = m.tool_calls.clone();
                 for call in &mut tool_calls {
-                    call.input = call
-                        .input
-                        .as_deref()
-                        .map(|input| parse_utils::clip(input, MAX_TOOL_IO).0);
+                    call.full_input = None;
                 }
                 MessageStructure {
                     seq: m.seq,
@@ -1530,6 +1527,7 @@ mod tests {
 
     fn tc(name: &str, preview: &str, input: Option<&str>) -> ToolCallView {
         ToolCallView {
+            full_input: None,
             id: String::new(),
             name: name.to_string(),
             input_preview: preview.to_string(),
@@ -1723,7 +1721,7 @@ mod tests {
         );
     }
     #[test]
-    fn usage_only_messages_keep_an_index_row() {
+    fn usage_only_messages_do_not_add_index_rows() {
         let mut message = msg(7, "", &[]);
         assert!(units_from_messages(&[message.clone()]).is_empty());
         message.usage = Some(TokenUsage {
@@ -1731,8 +1729,6 @@ mod tests {
             ..Default::default()
         });
         let units = units_from_messages(&[message]);
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].seq, 7);
-        assert!(units[0].text.is_empty());
+        assert!(units.is_empty());
     }
 }

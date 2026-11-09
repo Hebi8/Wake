@@ -64,15 +64,14 @@ fn antigravity_acp_discovery_cwd_and_planner_usage_exclude_checkpoints() {
     assert_eq!(refs[0].native_id, "alice-session");
     let t = parse(adapter.as_ref(), &path);
     assert_eq!(t.meta.project_path, "/home/alice/project");
-    assert_eq!(t.meta.tokens_used, Some(56));
+    assert_eq!(t.meta.tokens_used, Some(16));
     assert_eq!(
         t.mainline[1].usage,
         usage(Some(12), Some(4), Some(40), None)
     );
     assert_eq!(t.mainline[2].kind, MessageKind::CompactSummary);
     assert_eq!(t.mainline[2].usage, None);
-    assert_eq!(t.mainline[3].usage, usage(None, Some(0), None, None));
-    assert!(t.mainline[3].text.is_empty());
+    assert_eq!(t.mainline.len(), 5);
     assert_eq!(t.mainline.last().unwrap().usage, None);
 }
 
@@ -111,8 +110,7 @@ fn dsh_merges_distinct_calls_and_keeps_usage_only_messages() {
         t.mainline[0].usage,
         usage(Some(14), Some(2), Some(30), Some(5))
     );
-    assert_eq!(t.mainline[2].usage, usage(None, Some(0), None, None));
-    assert!(t.mainline[2].text.is_empty());
+    assert_eq!(t.mainline.len(), 2);
 }
 
 #[test]
@@ -122,10 +120,10 @@ fn dsh_inherited_usage_is_excluded_even_without_a_new_user_row() {
     let adapter = DshAdapter::new().with_custom_root(tmp.path().to_path_buf());
     let t = parse(adapter.as_ref(), &path);
     assert_eq!(t.meta.tokens_used, Some(6));
-    assert_eq!(t.mainline.len(), 2);
+    assert_eq!(t.mainline.len(), 1);
     assert_eq!(t.mainline[0].kind, MessageKind::Meta);
     assert_eq!(t.mainline[0].usage, None);
-    assert_eq!(t.mainline[1].usage, usage(Some(4), Some(2), None, None));
+    assert!(t.mainline.iter().all(|m| m.usage.is_none()));
 }
 
 #[test]
@@ -140,9 +138,8 @@ fn pi_preserves_cache_split_and_usage_only_calls() {
         usage(Some(14), Some(3), Some(30), Some(5))
     );
     assert_eq!(t.mainline[0].text, "Checked.");
-    assert_eq!(t.mainline[2].usage, usage(None, Some(0), None, None));
-    assert!(t.mainline[2].text.is_empty());
-    assert_eq!(t.mainline[4].usage, None);
+    assert_eq!(t.mainline.len(), 4);
+    assert_eq!(t.mainline[3].usage, None);
 }
 
 #[test]
@@ -155,7 +152,7 @@ fn kimi_usage_follows_steps_and_preserves_tool_and_fork_mapping() {
     );
     let adapter = KimiAdapter::new().with_custom_root(tmp.path().to_path_buf());
     let t = parse(adapter.as_ref(), &path);
-    assert_eq!(t.meta.tokens_used, Some(31));
+    assert_eq!(t.meta.tokens_used, Some(23));
     assert_eq!(t.mainline[0].kind, MessageKind::Meta);
     assert_eq!(t.mainline[0].usage, None);
     assert_eq!(t.mainline[1].usage, usage(Some(14), Some(3), None, None));
@@ -163,9 +160,9 @@ fn kimi_usage_follows_steps_and_preserves_tool_and_fork_mapping() {
         t.mainline[1].tool_calls[0].output.as_deref(),
         Some("Synthetic contents.")
     );
-    assert_eq!(t.mainline[2].usage, usage(None, Some(0), None, None));
+    assert_eq!(t.mainline.len(), 3);
     assert_eq!(
-        t.mainline[3].usage,
+        t.mainline[2].usage,
         usage(Some(3), Some(1), Some(8), Some(2))
     );
 }
@@ -176,16 +173,14 @@ fn grok_completion_is_a_prompt_snapshot_not_an_api_call_or_session_increment() {
     let path = stage(tmp.path(), "alice-session/updates.jsonl", "grok.jsonl");
     let adapter = GrokAdapter::new().with_custom_root(tmp.path().to_path_buf());
     let t = parse(adapter.as_ref(), &path);
-    assert_eq!(t.meta.tokens_used, Some(79));
+    assert_eq!(t.meta.tokens_used, Some(45));
+    assert_eq!(t.mainline.len(), 4);
+    // Empty completions share the nearest display reply; cache-write defaults to zero.
     assert_eq!(
         t.mainline[1].usage,
-        usage(Some(20), Some(7), Some(30), Some(10))
+        usage(Some(26), Some(9), Some(34), Some(10))
     );
-    // Missing cache creation prevents inferring uncached input. The source's
-    // prompt total remains usable, independently of the incomplete split.
-    assert_eq!(t.mainline[3].usage, usage(None, Some(2), Some(4), None));
-    assert!(t.mainline[3].text.is_empty());
-    assert_eq!(t.mainline[5].usage, None);
+    assert_eq!(t.mainline[3].usage, None);
 }
 
 #[test]
@@ -220,7 +215,7 @@ fn grok_tool_update_preserves_full_input_for_derivation() {
     let adapter = GrokAdapter::new().with_custom_root(tmp.path().to_path_buf());
     let t = parse(adapter.as_ref(), &path);
     let saved: serde_json::Value =
-        serde_json::from_str(t.mainline[0].tool_calls[0].input.as_deref().unwrap()).unwrap();
+        serde_json::from_str(t.mainline[0].tool_calls[0].full_input.as_deref().unwrap()).unwrap();
     assert_eq!(saved["patch"], input);
 }
 
@@ -239,7 +234,9 @@ fn hermes_structured_failures_preserve_call_mapping_and_unknown_usage() {
     assert_eq!(t.meta.tokens_used, Some(12));
     assert_eq!(t.mainline[0].role, Role::Assistant);
     assert_eq!(t.mainline[0].usage, None);
-    let calls = &t.mainline[0].tool_calls;
+    assert!(t.mainline[0].tool_calls.iter().all(|c| !c.is_error));
+    let indexed = adapter.parse_session(&refs[0]).unwrap();
+    let calls = &indexed.structure[0].tool_calls;
     assert_eq!(calls.len(), 8);
     for call in calls {
         assert_eq!(
@@ -299,16 +296,42 @@ fn hermes_status_and_wholly_failed_batches_match_source_semantics() {
     drop(db);
     let adapter = HermesAdapter::new().with_custom_root(tmp.path().to_path_buf());
     let t = adapter
-        .parse_transcript(&adapter.list_session_files().unwrap()[0])
+        .parse_session(&adapter.list_session_files().unwrap()[0])
         .unwrap();
     for (i, (_, expected)) in cases.iter().enumerate() {
         let id = format!("alice-batch-{i}");
         let call = t
-            .mainline
+            .structure
             .iter()
             .flat_map(|m| &m.tool_calls)
             .find(|c| c.id == id)
             .unwrap();
         assert_eq!(call.is_error, *expected, "{id}");
     }
+}
+
+#[test]
+fn grok_different_prompt_ids_accumulate_on_the_same_display_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("alice/updates.jsonl");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let rows = [
+        json!({"params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Working."}}}}),
+        json!({"params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"alice-a","usage":{"inputTokens":10,"outputTokens":2,"cachedReadTokens":4}}}}),
+        json!({"params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"alice-b","usage":{"inputTokens":20,"outputTokens":3,"cachedReadTokens":5}}}}),
+        json!({"params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"alice-a","usage":{"inputTokens":11,"outputTokens":2,"cachedReadTokens":4}}}}),
+    ];
+    fs::write(
+        &path,
+        rows.iter().map(|r| format!("{r}\n")).collect::<String>(),
+    )
+    .unwrap();
+    let adapter = GrokAdapter::new().with_custom_root(tmp.path().to_owned());
+    let t = parse(adapter.as_ref(), &path);
+    assert_eq!(t.mainline.len(), 1);
+    assert_eq!(
+        t.mainline[0].usage,
+        usage(Some(22), Some(5), Some(9), Some(0))
+    );
+    assert_eq!(t.meta.tokens_used, Some(27));
 }

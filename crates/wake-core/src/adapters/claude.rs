@@ -564,8 +564,6 @@ struct ParseResult {
 #[derive(Default)]
 struct PendingAssistant {
     msg_id: Option<String>,
-    usage: Option<TokenUsage>,
-    has_identified_usage: bool,
     content: ParsedContent,
     thinking: Vec<String>,
     tool_calls: Vec<ToolCallView>,
@@ -590,13 +588,7 @@ fn flush_assistant(
 ) {
     let Some(p) = pending.take() else { return };
     let ParsedContent { text, images } = p.content;
-    if text.is_empty()
-        && p.thinking.is_empty()
-        && p.tool_calls.is_empty()
-        && images.is_empty()
-        && p.usage.is_none()
-        && !p.has_identified_usage
-    {
+    if text.is_empty() && p.thinking.is_empty() && p.tool_calls.is_empty() && images.is_empty() {
         return;
     }
     let (clipped, truncated, full_text) = clip_message(&text);
@@ -613,7 +605,7 @@ fn flush_assistant(
         }
     }
     messages.push(TranscriptMessage {
-        usage: p.usage,
+        usage: None,
         seq: 0,
         role: Role::Assistant,
         kind: MessageKind::Text,
@@ -654,6 +646,7 @@ fn parse_claude_jsonl(
     // One owner per API id, including repeats separated by other messages.
     // The source's last snapshot wins, even when it replaces nonzero values with zero.
     let mut call_usage: HashMap<String, (usize, TokenUsage)> = HashMap::new();
+    let mut unidentified_usage = Vec::new();
     let mut created_at: i64 = 0;
     let mut updated_at: i64 = 0;
     let mut unknown_lines: u32 = 0;
@@ -871,10 +864,8 @@ fn parse_claude_jsonl(
             }
         }
         // 复制来的助手消息带着原件那次调用的 usage,算进分支就重复计了
-        if let Some(usage) = message.get("usage").filter(|u| {
-            !in_prefix
-                && u.is_object()
-                && message.get("model").and_then(Value::as_str) != Some("<synthetic>")
+        if let Some(usage) = message.get("usage").filter(|_| {
+            !in_prefix && message.get("model").and_then(Value::as_str) != Some("<synthetic>")
         }) {
             let usage = TokenUsage {
                 input: usage.get("input_tokens").and_then(Value::as_i64),
@@ -889,11 +880,10 @@ fn parse_claude_jsonl(
                     *last = usage;
                 } else if usage != TokenUsage::default() {
                     call_usage.insert(id.to_string(), (messages.len(), usage));
-                    p.has_identified_usage = true;
                 }
             } else if usage != TokenUsage::default() {
                 // Without an API id, retain the existing per-record counting rule.
-                p.usage.get_or_insert_default().add(usage);
+                unidentified_usage.push((messages.len(), usage));
             }
         }
         match message.get("content") {
@@ -938,9 +928,11 @@ fn parse_claude_jsonl(
         }
     }
     flush_assistant(&mut pending, &mut messages, &mut tool_index);
-    for (owner, usage) in call_usage.into_values() {
+    let mut tokens_used = None;
+    for (owner, usage) in call_usage.into_values().chain(unidentified_usage) {
         if usage != TokenUsage::default() {
-            messages[owner].usage.get_or_insert_default().add(usage);
+            tokens_used = Some(tokens_used.unwrap_or(0) + usage.new_tokens());
+            attach_usage(&mut messages, owner, usage);
         }
     }
     if let Some(inh) = inherited {
@@ -965,11 +957,6 @@ fn parse_claude_jsonl(
         }
     }
     assign_seq(&mut messages);
-    let tokens_used = messages
-        .iter()
-        .filter_map(|m| m.usage)
-        .map(TokenUsage::total)
-        .reduce(|a, b| a + b);
 
     let titled = !custom_title.is_empty();
     let title = [custom_title, ai_title, fallback_title]

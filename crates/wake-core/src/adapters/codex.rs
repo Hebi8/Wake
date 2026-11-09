@@ -585,58 +585,44 @@ fn response_usage(value: &Value) -> Option<TokenUsage> {
     (usage != TokenUsage::default()).then_some(usage)
 }
 
-// A response can produce several display messages. Its final model item owns usage;
-// tools and reasoning in the next response must not reuse the completed host.
+// Usage ownership is independent of the established display-message grouping.
 #[derive(Default)]
 struct ResponseOwner {
-    start: usize,
     message: Option<usize>,
 }
-
 impl ResponseOwner {
-    fn reset(&mut self, len: usize) {
-        self.start = len;
+    fn reset(&mut self) {
         self.message = None;
     }
-
-    fn complete(
-        &mut self,
-        messages: &mut Vec<TranscriptMessage>,
-        usage: TokenUsage,
-        ts: i64,
-    ) -> usize {
-        let owner = self.message.unwrap_or_else(|| {
-            messages.push(mk_msg(Role::Assistant, MessageKind::Text, "", ts));
-            messages.len() - 1
-        });
-        messages[owner].usage = Some(usage);
-        self.reset(messages.len());
-        owner
+    fn complete(&mut self, messages: &[TranscriptMessage]) -> usize {
+        self.message
+            .take()
+            .or_else(|| {
+                messages
+                    .iter()
+                    .rposition(|m| m.role == Role::Assistant && m.kind == MessageKind::Text)
+            })
+            .unwrap_or(messages.len())
     }
 }
 
 // Only source-defined process status fields/header lines count as errors. In particular,
 // stdout mentioning an error or an exit code is not a process status.
 fn output_exit_code(output: &Value) -> Option<i64> {
-    if let Some(code) = output.get("exit_code").and_then(Value::as_i64).or_else(|| {
-        output
-            .pointer("/metadata/exit_code")
-            .and_then(Value::as_i64)
-    }) {
+    if let Some(code) = output
+        .pointer("/metadata/exit_code")
+        .and_then(Value::as_i64)
+    {
         return Some(code);
     }
-    if let Some(content) = output.get("content") {
-        return output_exit_code(content);
-    }
     if let Some(parts) = output.as_array() {
-        return parts.iter().find_map(|part| {
+        let first = parts.iter().find(|part| {
             matches!(
                 part.get("type").and_then(Value::as_str),
                 Some("input_text" | "text")
             )
-            .then(|| part.get("text").and_then(output_exit_code))
-            .flatten()
-        });
+        })?;
+        return first.get("text").and_then(output_exit_code);
     }
     let text = output.as_str()?;
     if let Ok(value) = serde_json::from_str::<Value>(text) {
@@ -646,6 +632,9 @@ fn output_exit_code(output: &Value) -> Option<i64> {
     }
     let mut lines = text.lines();
     let first = lines.next()?;
+    if first == "Script failed" {
+        return Some(1);
+    }
     // core/src/tools/mod.rs: the shell formatter starts with Exit code, then Wall time.
     if let Some(code) = first.strip_prefix("Exit code: ") {
         return lines
@@ -679,7 +668,9 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
     let mut pending_review_message: Option<usize> = None;
     let mut response = ResponseOwner::default();
     let mut fallback_response = ResponseOwner::default();
-    let mut response_ids: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut response_ids: HashMap<String, usize> = HashMap::new();
+    let mut response_usage_rows: Vec<(usize, usize, TokenUsage)> = Vec::new();
+    let mut inherited_usage_rows = 0;
     let mut last_count_total = 0;
     let mut current_since_count = false;
     let mut cwd = String::new();
@@ -732,8 +723,9 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                 .is_some_and(|ordinal| ordinal >= start)
             {
                 inherited = Some((messages.len(), event_fallback.len()));
-                response.reset(messages.len());
-                fallback_response.reset(event_fallback.len());
+                inherited_usage_rows = response_usage_rows.len();
+                response.reset();
+                fallback_response.reset();
             }
         }
         let (typ, payload) = if legacy {
@@ -799,7 +791,7 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                     "message" => {
                         let role = payload.get("role").and_then(|v| v.as_str()).unwrap_or("");
                         if role != "assistant" {
-                            response.reset(messages.len());
+                            response.reset();
                         }
                         let content = payload.get("content").unwrap_or(&Value::Null);
                         let blocks = content
@@ -865,11 +857,9 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                             // 同 need_host:fork 段里的宿主待会儿会被 splice 掉
                             let last_is_inherited =
                                 inherited.is_some_and(|(cut, _)| messages.len() <= cut);
-                            let messages_len = messages.len();
                             match messages.last_mut() {
                                 Some(last)
                                     if !last_is_inherited
-                                        && response.start < messages_len
                                         && last.role == Role::Assistant
                                         && last.text.is_empty()
                                         && last.thinking.is_none() =>
@@ -910,15 +900,13 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                             });
                         let preview_source: Value = serde_json::from_str(&raw_input)
                             .unwrap_or(Value::String(raw_input.clone()));
+                        let (input, full_input) = clip_tool_input(raw_input);
                         let call = ToolCallView {
+                            full_input,
                             id: call_id.clone(),
                             name,
                             input_preview: make_preview(&preview_source),
-                            input: if raw_input.is_empty() {
-                                None
-                            } else {
-                                Some(raw_input)
-                            },
+                            input,
                             output: None,
                             is_error: false,
                             child_id: None,
@@ -929,7 +917,6 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                         let last_is_inherited =
                             inherited.is_some_and(|(cut, _)| messages.len() <= cut);
                         let need_host = last_is_inherited
-                            || messages.len() <= response.start
                             || !matches!(
                                 messages.last(),
                                 Some(m) if m.role == Role::Assistant && m.kind == MessageKind::Text
@@ -976,8 +963,9 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                             let to = payload.get("recipient").and_then(Value::as_str);
                             if !mine.is_empty() && to == Some(mine) {
                                 inherited = Some((messages.len(), event_fallback.len()));
-                                response.reset(messages.len());
-                                fallback_response.reset(event_fallback.len());
+                                inherited_usage_rows = response_usage_rows.len();
+                                response.reset();
+                                fallback_response.reset();
                             }
                         }
                     }
@@ -1001,8 +989,11 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                                         .pointer("/info/last_token_usage")
                                         .and_then(response_usage)
                                     {
-                                        response.complete(&mut messages, usage, ts);
-                                        fallback_response.complete(&mut event_fallback, usage, ts);
+                                        response_usage_rows.push((
+                                            response.complete(&messages),
+                                            fallback_response.complete(&event_fallback),
+                                            usage,
+                                        ));
                                     }
                                 }
                                 last_count_total = total;
@@ -1011,8 +1002,8 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                         }
                     }
                     "user_message" => {
-                        response.reset(messages.len());
-                        fallback_response.reset(event_fallback.len());
+                        response.reset();
+                        fallback_response.reset();
                         if let Some(m) = payload.get("message").and_then(|v| v.as_str()) {
                             let cleaned = clean_user_text(m);
                             if !cleaned.trim().is_empty() {
@@ -1099,17 +1090,20 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                 }
                 if let Some(usage) = payload.get("usage").and_then(response_usage) {
                     let id = payload.get("response_id").and_then(Value::as_str);
-                    if let Some(&(owner, fallback)) = id.and_then(|id| response_ids.get(id)) {
-                        messages[owner].usage = Some(usage);
-                        event_fallback[fallback].usage = Some(usage);
+                    if let Some(&row) = id.and_then(|id| response_ids.get(id)) {
+                        response_usage_rows[row].2 = usage;
                     } else {
-                        let owner = response.complete(&mut messages, usage, ts);
-                        let fallback = fallback_response.complete(&mut event_fallback, usage, ts);
+                        let row = response_usage_rows.len();
+                        response_usage_rows.push((
+                            response.complete(&messages),
+                            fallback_response.complete(&event_fallback),
+                            usage,
+                        ));
                         if let Some(id) = id {
-                            response_ids.insert(id.to_string(), (owner, fallback));
+                            response_ids.insert(id.to_string(), row);
                         }
-                        current_since_count = true;
                     }
+                    current_since_count = true;
                 }
             }
             // 语音会话的起止标记;transcript_segment 这类带内容的子类型还没见过样本,照旧计未知行
@@ -1125,10 +1119,16 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
         tokens_used = usage_record_tokens;
     }
 
-    let has_response_usage = messages
-        .iter()
-        .chain(&event_fallback)
-        .any(|m| m.usage.is_some());
+    let owned_tokens = (!response_usage_rows.is_empty()).then(|| {
+        response_usage_rows[inherited_usage_rows..]
+            .iter()
+            .map(|(_, _, usage)| usage.total())
+            .sum()
+    });
+    for (owner, fallback, usage) in response_usage_rows {
+        attach_usage(&mut messages, owner, usage);
+        attach_usage(&mut event_fallback, fallback, usage);
+    }
     // fork 段先折叠再判 has_real:折完只剩一条 Meta 的子线程要走得到
     // event_msg 回退,与普通会话同一条路。回退流只截断、**不留标记**——
     // 它一非空就会在 has_real 为假时被选中,一条标记足以把子线程自己的
@@ -1146,28 +1146,14 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
         .any(|m| m.kind == MessageKind::Text && (!m.text.is_empty() || !m.images.is_empty()));
     let mut final_messages = if has_real {
         messages
-    } else if event_fallback
-        .iter()
-        .any(|m| !m.text.is_empty() || !m.images.is_empty())
-    {
+    } else if !event_fallback.is_empty() {
         event_fallback
     } else {
         messages
     };
     assign_seq(&mut final_messages);
-    // A fork's source cumulative counter includes its copied parent history.
-    // Prefer the owned, deduplicated responses; total-only sources keep their total.
-    let tokens_used = if has_response_usage {
-        Some(
-            final_messages
-                .iter()
-                .filter_map(|m| m.usage)
-                .map(TokenUsage::total)
-                .sum(),
-        )
-    } else {
-        tokens_used
-    };
+    // Count response records even when no display message can host their usage.
+    let tokens_used = owned_tokens.or(tokens_used);
 
     Ok(CodexParse {
         messages: final_messages,
@@ -1560,6 +1546,10 @@ impl AgentAdapter for CodexAdapter {
         let meta = build_meta(r, &parsed, &self.archived_dir);
         let mut mainline = parsed.messages;
         self.link_spawned(&meta.id, &mut mainline);
+        // New error annotations belong to the index side table; preserve Wake's rendering.
+        for call in mainline.iter_mut().flat_map(|m| &mut m.tool_calls) {
+            call.is_error = false;
+        }
         Ok(ParsedTranscript {
             meta,
             mainline,

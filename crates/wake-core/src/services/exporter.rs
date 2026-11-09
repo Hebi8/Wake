@@ -448,6 +448,7 @@ mod compact_tests {
             "Let me edit the file.",
         );
         tool.tool_calls.push(ToolCallView {
+            full_input: None,
             id: "t1".into(),
             name: "Edit".into(),
             input_preview: "src/db.rs".into(),
@@ -570,6 +571,7 @@ mod compact_tests {
         );
         for i in 0..120 {
             m.tool_calls.push(ToolCallView {
+                full_input: None,
                 id: format!("t{i}"),
                 name: "Bash".into(),
                 input_preview: format!("cargo test --test case_{i:03}"),

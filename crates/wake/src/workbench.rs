@@ -1100,6 +1100,7 @@ mod session_group_tests {
 
     fn tool_call(name: &str, input_preview: &str) -> ToolCallView {
         ToolCallView {
+            full_input: None,
             id: name.to_string(),
             name: name.to_string(),
             input_preview: input_preview.to_string(),

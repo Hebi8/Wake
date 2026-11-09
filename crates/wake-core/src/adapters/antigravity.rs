@@ -269,12 +269,7 @@ fn transcript(
         created_at: if t.first_ts > 0 { t.first_ts } else { fallback },
         updated_at: if t.last_ts > 0 { t.last_ts } else { fallback },
         message_count: t.messages.len() as i64,
-        tokens_used: t
-            .messages
-            .iter()
-            .filter_map(|m| m.usage)
-            .map(TokenUsage::total)
-            .reduce(|a, b| a + b),
+        tokens_used: t.tokens_used,
         model: t.model,
         source: surface(app),
         spawned: row.is_some_and(|row| row.parent.is_some()),
@@ -421,6 +416,7 @@ const CWD_KEYS: &[&str] = &["Cwd", "DirectoryPath", "SearchPath"];
 
 #[derive(Default)]
 struct Transcript {
+    tokens_used: Option<i64>,
     messages: Vec<TranscriptMessage>,
     /// 工具的工作目录 > 用户当时打开的文件所在目录
     workspace: Option<String>,
@@ -443,11 +439,11 @@ struct Turn {
 impl Turn {
     fn flush(&mut self, messages: &mut Vec<TranscriptMessage>) {
         let turn = std::mem::take(self);
-        if turn.content.text.is_empty()
-            && turn.thinking.is_empty()
-            && turn.tool_calls.is_empty()
-            && turn.usage.is_none()
-        {
+        if turn.content.text.is_empty() && turn.thinking.is_empty() && turn.tool_calls.is_empty() {
+            if let Some(usage) = turn.usage {
+                let anchor = messages.len();
+                attach_usage(messages, anchor, usage);
+            }
             return;
         }
         let (text, truncated, full_text) = clip_message(&turn.content.text);
@@ -517,6 +513,7 @@ fn read_transcript(path: &Path, decode_images: bool) -> Result<Transcript> {
                     cache_write: None,
                 };
                 if usage != TokenUsage::default() {
+                    t.tokens_used = Some(t.tokens_used.unwrap_or(0) + usage.new_tokens());
                     turn.usage.get_or_insert_default().add(usage);
                 }
                 if turn.timestamp.is_none() && ts > 0 {

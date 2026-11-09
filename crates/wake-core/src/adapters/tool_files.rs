@@ -8,7 +8,7 @@ pub(super) fn from_call(
     idx: usize,
     cwd: &str,
 ) -> Vec<ToolFile> {
-    let Some(input) = call.input.as_deref() else {
+    let Some(input) = call.full_input.as_deref().or(call.input.as_deref()) else {
         return Vec::new();
     };
     let value = serde_json::from_str::<Value>(input).ok();
@@ -33,8 +33,10 @@ pub(super) fn from_call(
             let (fields, op): (&[&str], _) = match name {
                 "Edit" | "Write" => (&["file_path"], "change"),
                 "Read" => (&["file_path"], "read"),
-                "read" => (&["file_path", "path"], "read"),
-                "edit" | "write" => (&["file_path", "path"], "change"),
+                "ReadFile" => (&["path"], "read"),
+                "NotebookEdit" => (&["notebook_path"], "change"),
+                "read" => (&["file_path", "path", "filePath"], "read"),
+                "edit" | "write" => (&["file_path", "path", "filePath"], "change"),
                 "read_file" => (&["path", "Path"], "read"),
                 "write_file" => (&["path"], "change"),
                 "view_image" => (&["path"], "read"),
@@ -284,7 +286,7 @@ mod tests {
             "exec_command",
             "terminal",
             "run_command",
-            "mcp__lody__lody_board_files_write",
+            "mcp__example__write_file",
             "search_files",
         ] {
             assert!(files(
@@ -350,5 +352,38 @@ mod tests {
         assert_eq!(resolve("D:alice.txt", cwd), "D:alice.txt");
         assert_eq!(resolve("C:alice.txt", ""), "C:alice.txt");
         assert_eq!(resolve("C:alice.txt", "/home/alice/project"), "C:alice.txt");
+    }
+    #[test]
+    fn source_specific_file_names_and_arguments_are_recognized() {
+        for (agent, name, input, op) in [
+            (AgentId::Kimi, "ReadFile", json!({"path":"file.rs"}), "read"),
+            (
+                AgentId::Opencode,
+                "edit",
+                json!({"filePath":"file.rs"}),
+                "change",
+            ),
+            (
+                AgentId::Opencode,
+                "read",
+                json!({"filePath":"file.rs"}),
+                "read",
+            ),
+            (
+                AgentId::ClaudeCode,
+                "NotebookEdit",
+                json!({"notebook_path":"file.rs"}),
+                "change",
+            ),
+        ] {
+            assert_eq!(
+                files(agent, name, input),
+                vec![ToolFile {
+                    idx: 3,
+                    path: "/home/alice/project/file.rs".into(),
+                    op
+                }]
+            );
+        }
     }
 }

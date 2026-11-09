@@ -351,6 +351,7 @@ fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
         inherited: None,
     };
     // toolCallId → (消息下标, tool_calls 下标),tool/result 事件回填用
+    let mut usage_rows = Vec::new();
     let mut tool_index: HashMap<String, (usize, usize)> = HashMap::new();
 
     for line in reader.lines() {
@@ -504,8 +505,10 @@ fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
                     && tools.is_empty()
                     && thinking_parts.is_empty()
                     && parsed_message.images.is_empty()
-                    && usage.is_none()
                 {
+                    if let Some(usage) = usage {
+                        usage_rows.push((p.messages.len(), p.inherited.unwrap_or(0), usage));
+                    }
                     continue;
                 }
                 // 截点后的第一段回复另起一条:并进复制来的最后一条回复,收尾折叠时会一起折掉
@@ -522,7 +525,7 @@ fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
                 );
                 let last = &mut p.messages[base];
                 if let Some(usage) = usage {
-                    last.usage.get_or_insert_default().add(usage);
+                    usage_rows.push((base, p.inherited.unwrap_or(0), usage));
                 }
                 if model.is_some() {
                     last.model = model;
@@ -598,6 +601,9 @@ fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
                 p.unknown_lines += 1;
             }
         }
+    }
+    for (anchor, floor, usage) in usage_rows {
+        attach_usage(&mut p.messages[floor..], anchor - floor, usage);
     }
     if let Some(cut) = p.inherited {
         collapse_inherited(&mut p.messages, cut, "session");

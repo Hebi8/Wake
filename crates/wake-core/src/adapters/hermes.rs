@@ -531,7 +531,11 @@ impl AgentAdapter for HermesAdapter {
     }
 
     fn parse_transcript(&self, r: &SessionFileRef) -> Result<ParsedTranscript> {
-        let (meta, messages) = self.parse(r)?;
+        let (meta, mut messages) = self.parse(r)?;
+        // Preserve the pre-structure transcript; error annotations are indexed separately.
+        for call in messages.iter_mut().flat_map(|m| &mut m.tool_calls) {
+            call.is_error = false;
+        }
         Ok(ParsedTranscript {
             meta,
             mainline: messages,

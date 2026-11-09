@@ -1280,6 +1280,35 @@ pub fn decoded_arguments(args: &Value) -> std::borrow::Cow<'_, Value> {
     }
 }
 
+pub fn clip_tool_input(input: String) -> (Option<String>, Option<String>) {
+    if input.is_empty() {
+        return (None, None);
+    }
+    let (clipped, truncated) = clip(&input, MAX_TOOL_IO);
+    (Some(clipped), truncated.then_some(input))
+}
+
+/// Attach accounting to existing display messages without changing their grouping.
+pub fn attach_usage(messages: &mut [TranscriptMessage], anchor: usize, usage: TokenUsage) {
+    let anchor = anchor.min(messages.len());
+    let assistant =
+        |m: &TranscriptMessage| m.role == Role::Assistant && m.kind == MessageKind::Text;
+    let owner = messages
+        .get(anchor)
+        .filter(|m| assistant(m))
+        .map(|_| anchor)
+        .or_else(|| messages[..anchor].iter().rposition(assistant))
+        .or_else(|| {
+            messages[anchor..]
+                .iter()
+                .position(assistant)
+                .map(|i| anchor + i)
+        });
+    if let Some(owner) = owner {
+        messages[owner].usage.get_or_insert_default().add(usage);
+    }
+}
+
 pub fn tool_call_view(
     id: String,
     name: &str,
@@ -1292,19 +1321,18 @@ pub fn tool_call_view(
     } else {
         serde_json::to_string_pretty(input).unwrap_or_default()
     };
+    let input_preview = make_preview(input);
+    let (input, full_input) = clip_tool_input(input_json);
     ToolCallView {
+        full_input,
         id,
         name: if name.is_empty() {
             "tool".to_string()
         } else {
             name.to_string()
         },
-        input_preview: make_preview(input),
-        input: if input_json.is_empty() {
-            None
-        } else {
-            Some(input_json)
-        },
+        input_preview,
+        input,
         output: output.map(|o| clip(&o, MAX_TOOL_IO).0),
         is_error,
         child_id: None,

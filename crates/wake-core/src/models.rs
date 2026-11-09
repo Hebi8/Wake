@@ -309,6 +309,9 @@ pub struct SessionMeta {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallView {
+    /// Uncut tool input for file derivation, never part of Wake output.
+    #[serde(skip)]
+    pub full_input: Option<String>,
     pub id: String,
     pub name: String,
     pub input_preview: String,
@@ -391,6 +394,13 @@ impl TokenUsage {
         }
     }
 
+    pub fn new_tokens(self) -> i64 {
+        [self.input, self.output, self.cache_write]
+            .into_iter()
+            .flatten()
+            .sum()
+    }
+
     pub fn total(self) -> i64 {
         [self.input, self.output, self.cache_read, self.cache_write]
             .into_iter()
@@ -402,7 +412,7 @@ impl TokenUsage {
 /// 详情页统一消息模型
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptMessage {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub usage: Option<TokenUsage>,
     /// 会话内稳定序号(搜索定位锚点)
     pub seq: i64,

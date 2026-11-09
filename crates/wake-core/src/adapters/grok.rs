@@ -148,9 +148,8 @@ struct Replay {
     cur_ts: i64,
     // PromptUsage is a snapshot of one completed prompt, potentially containing
     // many model calls (and completed subagents), not an individual API call.
-    cur_usage: Option<TokenUsage>,
-    cur_tokens: Option<i64>,
-    tokens_used: Option<i64>,
+    usage_rows: Vec<(usize, TokenUsage)>,
+    prompt_usage: HashMap<String, usize>,
 }
 
 impl Replay {
@@ -164,9 +163,8 @@ impl Replay {
             cur_tools: Vec::new(),
             cur_images: Vec::new(),
             cur_ts: 0,
-            cur_usage: None,
-            cur_tokens: None,
-            tokens_used: None,
+            usage_rows: Vec::new(),
+            prompt_usage: HashMap::new(),
         }
     }
 
@@ -174,10 +172,6 @@ impl Replay {
         let Some(role) = self.cur_role.take() else {
             return;
         };
-        let usage = self.cur_usage.take();
-        if let Some(tokens) = self.cur_tokens.take() {
-            self.tokens_used = Some(self.tokens_used.unwrap_or(0) + tokens);
-        }
         let text = std::mem::take(&mut self.cur_text);
         let thinking = std::mem::take(&mut self.cur_thinking);
         let tools = std::mem::take(&mut self.cur_tools);
@@ -186,7 +180,6 @@ impl Replay {
             && thinking.trim().is_empty()
             && tools.is_empty()
             && images.is_empty()
-            && usage.is_none()
         {
             return;
         }
@@ -195,7 +188,6 @@ impl Replay {
             m.thinking = Some(clip(thinking.trim(), MAX_TOOL_IO).0);
         }
         m.images = images;
-        m.usage = usage;
         let base = self.messages.len();
         for (ix, tc) in tools.into_iter().enumerate() {
             self.tool_index.insert(tc.id.clone(), (base, ix));
@@ -263,7 +255,7 @@ fn apply_tool_update(
         if let Some(raw) = update.get("rawInput").filter(|r| !r.is_null()) {
             tc.input_preview = make_preview(raw);
             if let Ok(json) = serde_json::to_string_pretty(raw) {
-                tc.input = Some(json);
+                (tc.input, tc.full_input) = clip_tool_input(json);
             }
         }
     }
@@ -326,8 +318,8 @@ impl UpdateKind {
 
     fn opens_message(self) -> bool {
         match self {
-            Self::Chunk(_) | Self::Thought | Self::ToolCall | Self::TurnCompleted => true,
-            Self::ToolCallUpdate | Self::Known | Self::Unknown => false,
+            Self::Chunk(_) | Self::Thought | Self::ToolCall => true,
+            Self::ToolCallUpdate | Self::TurnCompleted | Self::Known | Self::Unknown => false,
         }
     }
 }
@@ -416,31 +408,32 @@ fn parse_grok_updates(
             }
             UpdateKind::TurnCompleted => {
                 if let Some(u) = update.get("usage") {
-                    rp.ensure(Role::Assistant, ts);
-                    // Bundled Grok headless guide: ACP PromptUsage.inputTokens
-                    // includes both cache buckets. Only normalize when the split
-                    // is known; absent counters must not be invented as zero.
                     let read = u.get("cachedReadTokens").and_then(Value::as_i64);
-                    let write = u.get("cacheCreationTokens").and_then(Value::as_i64);
-                    let input = u
-                        .get("inputTokens")
+                    // Older Grok versions omit cache creation when it is zero.
+                    let write = u
+                        .get("cacheCreationTokens")
                         .and_then(Value::as_i64)
-                        .zip(read)
-                        .zip(write)
-                        .and_then(|((input, read), write)| {
-                            input.checked_sub(read)?.checked_sub(write)
-                        })
-                        .filter(|input| *input >= 0);
+                        .unwrap_or(0);
                     let usage = TokenUsage {
-                        input,
+                        input: u
+                            .get("inputTokens")
+                            .and_then(Value::as_i64)
+                            .zip(read)
+                            .map(|(input, read)| input - read - write),
                         output: u.get("outputTokens").and_then(Value::as_i64),
                         cache_read: read,
-                        cache_write: write,
+                        cache_write: Some(write),
                     };
-                    // Replace repeated completion snapshots within this prompt.
-                    // params._meta.totalTokens is not an increment and is ignored.
-                    rp.cur_usage = (usage != TokenUsage::default()).then_some(usage);
-                    rp.cur_tokens = u.get("totalTokens").and_then(Value::as_i64);
+                    let prompt = update.get("prompt_id").and_then(Value::as_str);
+                    if let Some(&ix) = prompt.and_then(|id| rp.prompt_usage.get(id)) {
+                        rp.usage_rows[ix].1 = usage;
+                    } else {
+                        let ix = rp.usage_rows.len();
+                        rp.usage_rows.push((rp.messages.len(), usage));
+                        if let Some(id) = prompt {
+                            rp.prompt_usage.insert(id.to_owned(), ix);
+                        }
+                    }
                 }
             }
             UpdateKind::Known => {}
@@ -451,8 +444,16 @@ fn parse_grok_updates(
     }
     rp.flush();
     let mut messages = rp.messages;
+    let tokens = rp
+        .usage_rows
+        .iter()
+        .map(|(_, usage)| usage.new_tokens())
+        .reduce(|a, b| a + b);
+    for (anchor, usage) in rp.usage_rows {
+        attach_usage(&mut messages, anchor, usage);
+    }
     assign_seq(&mut messages);
-    Ok((messages, unknown, rp.tokens_used))
+    Ok((messages, unknown, tokens))
 }
 
 fn build_meta(

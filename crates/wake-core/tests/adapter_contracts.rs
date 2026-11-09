@@ -3795,7 +3795,7 @@ fn dsh_parse_contract() {
     assert_eq!(s.meta.tokens_used, Some(3440));
     assert_eq!(s.meta.created_at, 1786100000000); // header createdAt(epoch ms)
     assert_eq!(s.meta.updated_at, 1786100007000); // 最后事件 time
-    assert_eq!(s.meta.message_count, 3); // Meta/replace 不计；usage-only 调用保留
+    assert_eq!(s.meta.message_count, 2); // Meta/replace/usage-only 不新增显示行
     assert_eq!(s.unknown_line_count, 1); // mystery-row;*-chunks 打包行与 turn/step 边界不计
 
     // 连续 assistant step(中间只隔 tool/result)合并一条;source.kind 非 "user"
@@ -3807,7 +3807,6 @@ fn dsh_parse_contract() {
             (Role::Assistant, MessageKind::Text),
             (Role::User, MessageKind::Meta),
             (Role::User, MessageKind::Meta),
-            (Role::Assistant, MessageKind::Text),
         ]
     );
     let a = &t.mainline[1];
@@ -3831,7 +3830,7 @@ fn dsh_parse_contract() {
     assert!(!a.tool_calls[0].is_error);
     assert_eq!(
         s.units.iter().map(|u| u.seq).collect::<Vec<_>>(),
-        vec![0, 1, 4]
+        vec![0, 1]
     );
 }
 
