@@ -64,13 +64,14 @@ pub(super) fn from_call(
         }
     }
     let mut files = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for (path, op) in paths {
         let file = ToolFile {
             idx,
             path: resolve(&path, cwd),
             op,
         };
-        if !files.contains(&file) {
+        if seen.insert((file.path.clone(), file.op)) {
             files.push(file);
         }
     }
@@ -86,17 +87,121 @@ enum JsToken<'a> {
     Punct(char),
 }
 
-#[derive(Clone)]
+// One budget per exec input, shared by parsing, values, copies and loop bodies.
+const JS_MAX_DEPTH: usize = 32;
+const JS_MAX_STEPS: usize = 16 * 1024 * 1024;
+const JS_MAX_ITERATIONS: usize = 4096;
+const JS_MAX_STRING: usize = 8 * 1024 * 1024;
+const JS_MAX_ITEMS: usize = 4096;
+const JS_MAX_BYTES: usize = 64 * 1024 * 1024;
+const JS_MAX_INPUT: usize = 16 * 1024 * 1024;
+const JS_MAX_TOKENS: usize = 262_144;
+
+#[derive(Default)]
+struct JsBudget {
+    steps: usize,
+    iterations: usize,
+    bytes: usize,
+    max_depth: usize,
+    limited: bool,
+    exhausted: bool,
+}
+
+impl JsBudget {
+    fn step(&mut self, count: usize) -> bool {
+        if self.exhausted || count > JS_MAX_STEPS - self.steps {
+            self.limited = true;
+            self.exhausted = true;
+            return false;
+        }
+        self.steps += count;
+        true
+    }
+
+    fn allocate(&mut self, bytes: usize) -> bool {
+        if self.exhausted || bytes > JS_MAX_BYTES - self.bytes {
+            self.limited = true;
+            self.exhausted = true;
+            return false;
+        }
+        self.bytes += bytes;
+        true
+    }
+
+    fn depth(&mut self, depth: usize) -> bool {
+        if depth > JS_MAX_DEPTH {
+            self.limited = true;
+            return false;
+        }
+        self.max_depth = self.max_depth.max(depth);
+        !self.exhausted
+    }
+
+    fn items(&mut self, count: usize) -> bool {
+        if count > JS_MAX_ITEMS {
+            self.limited = true;
+            return false;
+        }
+        true
+    }
+
+    fn iteration(&mut self) -> bool {
+        if self.iterations == JS_MAX_ITERATIONS {
+            self.limited = true;
+            self.exhausted = true;
+            return false;
+        }
+        self.iterations += 1;
+        self.step(1)
+    }
+
+    fn append(&mut self, out: &mut String, text: &str) -> bool {
+        if text.len() > JS_MAX_STRING - out.len() {
+            self.limited = true;
+            return false;
+        }
+        if !self.step(text.len()) || !self.allocate(text.len()) {
+            return false;
+        }
+        out.push_str(text);
+        true
+    }
+
+    fn character(&mut self, out: &mut String, c: char) -> bool {
+        self.append(out, c.encode_utf8(&mut [0; 4]))
+    }
+
+    fn text(&mut self, text: &str) -> Option<String> {
+        let mut out = String::new();
+        self.append(&mut out, text).then_some(out)
+    }
+}
+
 enum JsValue {
     Text(String),
     Array(Vec<JsValue>),
     Object(Vec<(String, JsValue)>),
 }
 
-fn js_tokens(code: &str) -> Vec<JsToken<'_>> {
+fn js_unknown() -> JsValue {
+    JsValue::Text("\0".into())
+}
+type JsBindings<'a> = std::collections::HashMap<&'a str, JsValue>;
+
+fn js_tokens<'a>(code: &'a str, budget: &mut JsBudget) -> Vec<JsToken<'a>> {
+    let mut limit = code.len().min(JS_MAX_INPUT);
+    while !code.is_char_boundary(limit) {
+        limit -= 1;
+    }
+    budget.limited |= limit != code.len();
+    let code = &code[..limit];
     let mut tokens = Vec::new();
     let mut i = 0;
     while i < code.len() {
+        if tokens.len() == JS_MAX_TOKENS {
+            budget.limited = true;
+            break;
+        }
         let rest = &code[i..];
         let c = rest.chars().next().unwrap();
         if c.is_whitespace() {
@@ -110,6 +215,9 @@ fn js_tokens(code: &str) -> Vec<JsToken<'_>> {
         if rest.starts_with("/*") {
             i += rest.find("*/").map_or(rest.len(), |n| n + 2);
             continue;
+        }
+        if !budget.step(1) || !budget.allocate(std::mem::size_of::<JsToken<'_>>()) {
+            break;
         }
         if matches!(c, '\'' | '"' | '`') {
             let start = i;
@@ -140,75 +248,251 @@ fn js_tokens(code: &str) -> Vec<JsToken<'_>> {
     tokens
 }
 
-type JsBindings<'a> = std::collections::HashMap<&'a str, JsValue>;
+struct JsProgram<'a> {
+    tokens: Vec<JsToken<'a>>,
+    statements: Vec<usize>,
+    groups: Vec<usize>,
+}
 
-fn js_literal(raw: &str, bindings: &JsBindings<'_>) -> Option<String> {
+impl<'a> JsProgram<'a> {
+    fn new(code: &'a str, budget: &mut JsBudget) -> Option<Self> {
+        let tokens = js_tokens(code, budget);
+        let n = tokens.len();
+        if !budget.step(n * 2) || !budget.allocate((n + 1) * 2 * std::mem::size_of::<usize>()) {
+            return None;
+        }
+        let mut statements = vec![n; n + 1];
+        let mut groups = vec![n; n + 1];
+        // Cache each suffix's end once. Assignments in one long statement then
+        // take O(1) to find their end, instead of rescanning the same suffix.
+        for i in (0..n).rev() {
+            match tokens[i] {
+                JsToken::Punct(')' | ']' | '}') => {
+                    statements[i] = i;
+                    groups[i] = i;
+                }
+                JsToken::Punct(',' | ';') => {
+                    statements[i] = i;
+                    groups[i] = groups[i + 1];
+                }
+                JsToken::Punct('(' | '[' | '{') => {
+                    let close = groups[i + 1];
+                    if close < n {
+                        statements[i] = statements[close + 1];
+                        groups[i] = groups[close + 1];
+                    }
+                }
+                _ => {
+                    statements[i] = statements[i + 1];
+                    groups[i] = groups[i + 1];
+                }
+            }
+        }
+        Some(Self {
+            tokens,
+            statements,
+            groups,
+        })
+    }
+
+    fn end(&self, scope: &std::ops::Range<usize>, start: usize, statement: bool) -> usize {
+        let ends = if statement {
+            &self.statements
+        } else {
+            &self.groups
+        };
+        ends[scope.start + start].min(scope.end) - scope.start
+    }
+}
+
+fn js_copy(value: &JsValue, budget: &mut JsBudget, depth: usize) -> JsValue {
+    if !budget.depth(depth) || !budget.step(1) {
+        return js_unknown();
+    }
+    match value {
+        JsValue::Text(text) => budget
+            .text(text)
+            .map(JsValue::Text)
+            .unwrap_or_else(js_unknown),
+        JsValue::Array(items) => {
+            if !budget.items(items.len())
+                || !budget.allocate(items.len() * std::mem::size_of::<JsValue>())
+            {
+                return js_unknown();
+            }
+            let mut copy = Vec::with_capacity(items.len());
+            for item in items {
+                let value = js_copy(item, budget, depth + 1);
+                if budget.exhausted {
+                    return js_unknown();
+                }
+                copy.push(value);
+            }
+            JsValue::Array(copy)
+        }
+        JsValue::Object(items) => {
+            if !budget.items(items.len())
+                || !budget.allocate(items.len() * std::mem::size_of::<(String, JsValue)>())
+            {
+                return js_unknown();
+            }
+            let mut copy = Vec::with_capacity(items.len());
+            for (key, value) in items {
+                let Some(key) = budget.text(key) else {
+                    return js_unknown();
+                };
+                let value = js_copy(value, budget, depth + 1);
+                if budget.exhausted {
+                    return js_unknown();
+                }
+                copy.push((key, value));
+            }
+            JsValue::Object(copy)
+        }
+    }
+}
+
+fn js_bind<'a>(
+    bindings: &mut JsBindings<'a>,
+    name: &'a str,
+    value: JsValue,
+    budget: &mut JsBudget,
+) {
+    if !budget.step(name.len()) {
+        return;
+    }
+    if !bindings.contains_key(name) && !budget.allocate(std::mem::size_of::<(&str, JsValue)>()) {
+        return;
+    }
+    bindings.insert(name, value);
+}
+
+fn js_copy_bindings<'a>(
+    bindings: &JsBindings<'a>,
+    budget: &mut JsBudget,
+    depth: usize,
+) -> Option<JsBindings<'a>> {
+    let mut copy = JsBindings::new();
+    for (&name, value) in bindings {
+        let value = js_copy(value, budget, depth);
+        js_bind(&mut copy, name, value, budget);
+        if budget.exhausted {
+            return None;
+        }
+    }
+    Some(copy)
+}
+
+fn js_literal(raw: &str, bindings: &JsBindings<'_>, budget: &mut JsBudget) -> Option<String> {
+    if !budget.step(raw.len()) {
+        return None;
+    }
     let quote = raw.chars().next()?;
     let body = raw.strip_prefix(quote)?.strip_suffix(quote)?;
     let mut chars = body.chars().peekable();
     let mut out = String::new();
     while let Some(c) = chars.next() {
-        if c == '\\' {
+        let decoded = if c == '\\' {
             match chars.next()? {
-                'n' => out.push('\n'),
-                'r' => out.push('\r'),
-                't' => out.push('\t'),
-                'b' => out.push('\u{8}'),
-                'f' => out.push('\u{c}'),
-                'v' => out.push('\u{b}'),
-                '0' => out.push('\0'),
-                '\n' => {}
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                'b' => '\u{8}',
+                'f' => '\u{c}',
+                'v' => '\u{b}',
+                '0' => '\0',
+                '\n' => continue,
                 '\r' => {
                     if chars.peek() == Some(&'\n') {
                         chars.next();
                     }
+                    continue;
                 }
                 escape @ ('u' | 'x') => {
-                    let braced = escape == 'u' && chars.peek() == Some(&'{');
-                    let digits: String = if braced {
+                    let mut scalar = 0u32;
+                    if escape == 'u' && chars.peek() == Some(&'{') {
                         chars.next();
-                        chars.by_ref().take_while(|c| *c != '}').collect()
+                        let mut digits = 0;
+                        loop {
+                            let digit = chars.next()?;
+                            if digit == '}' {
+                                if digits == 0 {
+                                    return None;
+                                }
+                                break;
+                            }
+                            if digits == 6 {
+                                return None;
+                            }
+                            scalar = scalar * 16 + digit.to_digit(16)?;
+                            digits += 1;
+                        }
                     } else {
-                        chars
-                            .by_ref()
-                            .take(if escape == 'u' { 4 } else { 2 })
-                            .collect()
-                    };
-                    let mut scalar = u32::from_str_radix(&digits, 16).ok()?;
+                        for _ in 0..if escape == 'u' { 4 } else { 2 } {
+                            scalar = scalar * 16 + chars.next()?.to_digit(16)?;
+                        }
+                    }
                     if (0xd800..=0xdbff).contains(&scalar) {
                         if chars.next()? != '\\' || chars.next()? != 'u' {
                             return None;
                         }
-                        let low =
-                            u32::from_str_radix(&chars.by_ref().take(4).collect::<String>(), 16)
-                                .ok()?;
+                        let mut low = 0u32;
+                        for _ in 0..4 {
+                            low = low * 16 + chars.next()?.to_digit(16)?;
+                        }
                         scalar = 0x10000 + ((scalar - 0xd800) << 10) + low.checked_sub(0xdc00)?;
                     }
-                    out.push(char::from_u32(scalar)?);
+                    char::from_u32(scalar)?
                 }
-                other => out.push(other),
+                other => other,
             }
         } else if quote == '`' && c == '$' && chars.peek() == Some(&'{') {
             chars.next();
-            let name: String = chars.by_ref().take_while(|c| *c != '}').collect();
-            match bindings.get(name.trim()) {
-                Some(JsValue::Text(value)) => out.push_str(value),
-                _ => out.push('\0'),
+            let mut name = String::new();
+            for c in chars.by_ref().take_while(|c| *c != '}') {
+                if !budget.character(&mut name, c) {
+                    return None;
+                }
             }
+            if !budget.step(name.len()) {
+                return None;
+            }
+            let text = match bindings.get(name.trim()) {
+                Some(JsValue::Text(value)) => value,
+                _ => "\0",
+            };
+            if !budget.append(&mut out, text) {
+                return None;
+            }
+            continue;
         } else {
-            out.push(c);
+            c
+        };
+        if !budget.character(&mut out, decoded) {
+            return None;
         }
     }
     Some(out)
 }
 
-// Split only at the current expression level, leaving calls and arrays opaque.
-fn js_split<'a>(tokens: &'a [JsToken<'a>], separator: char) -> Vec<&'a [JsToken<'a>]> {
+fn js_split<'a>(
+    tokens: &'a [JsToken<'a>],
+    separator: char,
+    budget: &mut JsBudget,
+) -> Option<Vec<&'a [JsToken<'a>]>> {
+    if !budget.step(tokens.len()) {
+        return None;
+    }
     let (mut depth, mut start) = (0i32, 0);
     let mut parts = Vec::new();
     for (i, token) in tokens.iter().enumerate() {
         match token {
             JsToken::Punct(c) if *c == separator && depth == 0 => {
+                if !budget.items(parts.len() + 1)
+                    || !budget.allocate(std::mem::size_of::<&[JsToken<'_>]>())
+                {
+                    return None;
+                }
                 parts.push(&tokens[start..i]);
                 start = i + 1;
             }
@@ -217,18 +501,40 @@ fn js_split<'a>(tokens: &'a [JsToken<'a>], separator: char) -> Vec<&'a [JsToken<
             _ => {}
         }
     }
+    if !budget.items(parts.len() + 1) || !budget.allocate(std::mem::size_of::<&[JsToken<'_>]>()) {
+        return None;
+    }
     parts.push(&tokens[start..]);
-    parts
+    Some(parts)
 }
 
-fn js_value(tokens: &[JsToken<'_>], bindings: &JsBindings<'_>) -> JsValue {
-    let parts = js_split(tokens, '+');
+fn js_value(
+    tokens: &[JsToken<'_>],
+    bindings: &JsBindings<'_>,
+    budget: &mut JsBudget,
+    depth: usize,
+) -> JsValue {
+    if !budget.depth(depth) || !budget.step(1) {
+        return js_unknown();
+    }
+    // Assignment expressions are outside this static subset. Reject a chain
+    // before scanning its suffix; walking a=b=c=... stays linear as well.
+    if matches!(tokens, [JsToken::Word(_), JsToken::Punct('='), ..]) {
+        return js_unknown();
+    }
+    let Some(parts) = js_split(tokens, '+', budget) else {
+        return js_unknown();
+    };
     if parts.len() > 1 {
         let mut text = String::new();
         for part in parts {
-            match js_value(part, bindings) {
-                JsValue::Text(value) => text.push_str(&value),
-                _ => text.push('\0'),
+            let value = js_value(part, bindings, budget, depth + 1);
+            let text_part = match &value {
+                JsValue::Text(value) => value.as_str(),
+                _ => "\0",
+            };
+            if !budget.append(&mut text, text_part) {
+                return js_unknown();
             }
         }
         return JsValue::Text(text);
@@ -236,23 +542,33 @@ fn js_value(tokens: &[JsToken<'_>], bindings: &JsBindings<'_>) -> JsValue {
     if let [base @ .., JsToken::Punct('.'), JsToken::Word("join"), JsToken::Punct('('), JsToken::Literal(separator), JsToken::Punct(')')] =
         tokens
     {
-        if let (JsValue::Array(parts), Some(separator)) =
-            (js_value(base, bindings), js_literal(separator, bindings))
-        {
-            let strings: Vec<_> = parts
-                .into_iter()
-                .map(|value| match value {
-                    JsValue::Text(s) => s,
-                    _ => "\0".into(),
-                })
-                .collect();
-            return JsValue::Text(strings.join(&separator));
+        if let (JsValue::Array(parts), Some(separator)) = (
+            js_value(base, bindings, budget, depth + 1),
+            js_literal(separator, bindings, budget),
+        ) {
+            let mut text = String::new();
+            for (i, value) in parts.iter().enumerate() {
+                if i > 0 && !budget.append(&mut text, &separator) {
+                    return js_unknown();
+                }
+                let part = match value {
+                    JsValue::Text(s) => s.as_str(),
+                    _ => "\0",
+                };
+                if !budget.append(&mut text, part) {
+                    return js_unknown();
+                }
+            }
+            return JsValue::Text(text);
         }
     }
     if let [JsToken::Word("Object"), JsToken::Punct('.'), JsToken::Word("entries"), JsToken::Punct('('), inner @ .., JsToken::Punct(')')] =
         tokens
     {
-        if let JsValue::Object(entries) = js_value(inner, bindings) {
+        if let JsValue::Object(entries) = js_value(inner, bindings, budget, depth + 1) {
+            if !budget.allocate(entries.len() * 3 * std::mem::size_of::<JsValue>()) {
+                return js_unknown();
+            }
             return JsValue::Array(
                 entries
                     .into_iter()
@@ -262,126 +578,184 @@ fn js_value(tokens: &[JsToken<'_>], bindings: &JsBindings<'_>) -> JsValue {
         }
     }
     match tokens {
-        [JsToken::Literal(raw)] => {
-            JsValue::Text(js_literal(raw, bindings).unwrap_or_else(|| "\0".into()))
+        [JsToken::Literal(raw)] => js_literal(raw, bindings, budget)
+            .map(JsValue::Text)
+            .unwrap_or_else(js_unknown),
+        [JsToken::Word(name)] => {
+            if !budget.step(name.len()) {
+                return js_unknown();
+            }
+            bindings
+                .get(name)
+                .map(|v| js_copy(v, budget, depth))
+                .unwrap_or_else(js_unknown)
         }
-        [JsToken::Word(name)] => bindings
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| JsValue::Text("\0".into())),
-        [JsToken::Punct('['), inner @ .., JsToken::Punct(']')] => JsValue::Array(
-            js_split(inner, ',')
-                .into_iter()
-                .filter(|p| !p.is_empty())
-                .map(|part| js_value(part, bindings))
-                .collect(),
-        ),
+        [JsToken::Punct('['), inner @ .., JsToken::Punct(']')] => {
+            let Some(parts) = js_split(inner, ',', budget) else {
+                return js_unknown();
+            };
+            if !budget.allocate(parts.len() * std::mem::size_of::<JsValue>()) {
+                return js_unknown();
+            }
+            let mut items = Vec::with_capacity(parts.len());
+            for part in parts.into_iter().filter(|p| !p.is_empty()) {
+                items.push(js_value(part, bindings, budget, depth + 1));
+                if budget.exhausted {
+                    return js_unknown();
+                }
+            }
+            JsValue::Array(items)
+        }
         [JsToken::Punct('{'), inner @ .., JsToken::Punct('}')] => {
-            let entries = js_split(inner, ',')
-                .into_iter()
-                .filter_map(|part| {
-                    let [key, JsToken::Punct(':'), value @ ..] = part else {
-                        return None;
-                    };
-                    let key = match key {
-                        JsToken::Literal(raw) => js_literal(raw, bindings)?,
-                        JsToken::Word(name) => (*name).to_owned(),
-                        _ => return None,
-                    };
-                    Some((key, js_value(value, bindings)))
-                })
-                .collect();
+            let Some(parts) = js_split(inner, ',', budget) else {
+                return js_unknown();
+            };
+            if !budget.allocate(parts.len() * std::mem::size_of::<(String, JsValue)>()) {
+                return js_unknown();
+            }
+            let mut entries = Vec::with_capacity(parts.len());
+            for part in parts {
+                let [key, JsToken::Punct(':'), value @ ..] = part else {
+                    continue;
+                };
+                let key = match key {
+                    JsToken::Literal(raw) => js_literal(raw, bindings, budget),
+                    JsToken::Word(name) => budget.text(name),
+                    _ => None,
+                };
+                let Some(key) = key else {
+                    return js_unknown();
+                };
+                entries.push((key, js_value(value, bindings, budget, depth + 1)));
+                if budget.exhausted {
+                    return js_unknown();
+                }
+            }
             JsValue::Object(entries)
         }
-        _ => JsValue::Text("\0".into()),
+        _ => js_unknown(),
     }
-}
-
-fn js_end(tokens: &[JsToken<'_>], start: usize, statement: bool) -> usize {
-    let mut depth = 0;
-    for (i, token) in tokens.iter().enumerate().skip(start) {
-        match token {
-            JsToken::Punct(')' | ']' | '}') if depth == 0 => return i,
-            JsToken::Punct(',' | ';') if depth == 0 && statement => return i,
-            JsToken::Punct('(' | '[' | '{') => depth += 1,
-            JsToken::Punct(')' | ']' | '}') => depth -= 1,
-            _ => {}
-        }
-    }
-    tokens.len()
 }
 
 fn js_patch_calls<'a>(
-    tokens: &[JsToken<'a>],
+    program: &JsProgram<'a>,
+    scope: std::ops::Range<usize>,
     bindings: &mut JsBindings<'a>,
     patches: &mut Vec<String>,
+    budget: &mut JsBudget,
+    depth: usize,
 ) {
+    if !budget.depth(depth) {
+        return;
+    }
+    let tokens = &program.tokens[scope.clone()];
     let mut i = 0;
-    while i < tokens.len() {
+    while i < tokens.len() && budget.step(1) {
         if tokens.get(i..i + 2) == Some(&[JsToken::Word("for"), JsToken::Punct('(')]) {
-            let end = js_end(tokens, i + 2, true);
-            if let Some(of) = tokens[i + 2..end]
-                .iter()
-                .position(|t| *t == JsToken::Word("of"))
-            {
-                let of = i + 2 + of;
-                let names: Vec<_> = tokens[i + 2..of]
+            let end = program.end(&scope, i + 2, true);
+            // A missing ')' cannot supply a body range. In particular end+1
+            // would otherwise exceed this scope's token slice.
+            if tokens.get(end) == Some(&JsToken::Punct(')')) && budget.step(end - (i + 2)) {
+                if let Some(of) = tokens[i + 2..end]
                     .iter()
-                    .filter_map(|t| match t {
-                        JsToken::Word(name) if !matches!(*name, "const" | "let" | "var") => {
-                            Some(*name)
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                if let JsValue::Array(values) = js_value(&tokens[of + 1..end], bindings) {
-                    let braced = tokens.get(end + 1) == Some(&JsToken::Punct('{'));
-                    let start = end + if braced { 2 } else { 1 };
-                    let finish = js_end(tokens, start, !braced);
-                    for value in values {
-                        let mut local = bindings.clone();
-                        let values = if names.len() == 1 {
-                            vec![value]
-                        } else if let JsValue::Array(values) = value {
-                            values
-                        } else {
-                            Vec::new()
-                        };
-                        for (name, value) in names.iter().zip(values) {
-                            local.insert(name, value);
-                        }
-                        js_patch_calls(&tokens[start..finish], &mut local, patches);
-                        for (name, value) in bindings
-                            .iter_mut()
-                            .filter(|(name, _)| !names.contains(name))
-                        {
-                            if let Some(updated) = local.get(name) {
-                                *value = updated.clone();
+                    .position(|t| *t == JsToken::Word("of"))
+                {
+                    let of = i + 2 + of;
+                    let mut names = Vec::new();
+                    for token in &tokens[i + 2..of] {
+                        if let JsToken::Word(name) = token {
+                            if !matches!(*name, "const" | "let" | "var") {
+                                if !budget.items(names.len() + 1)
+                                    || !budget.allocate(std::mem::size_of::<&str>())
+                                {
+                                    return;
+                                }
+                                names.push(*name);
                             }
                         }
                     }
-                    i = finish + 1;
-                    continue;
+                    if !budget.allocate(names.len() * std::mem::size_of::<&str>()) {
+                        return;
+                    }
+                    let mut shadowed = std::collections::HashSet::with_capacity(names.len());
+                    for name in &names {
+                        if !budget.step(name.len()) {
+                            return;
+                        }
+                        shadowed.insert(*name);
+                    }
+                    if let JsValue::Array(values) =
+                        js_value(&tokens[of + 1..end], bindings, budget, depth + 1)
+                    {
+                        let braced = tokens.get(end + 1) == Some(&JsToken::Punct('{'));
+                        let start = end + if braced { 2 } else { 1 };
+                        let finish = program.end(&scope, start, !braced);
+                        for value in values {
+                            if !budget.iteration() {
+                                return;
+                            }
+                            let Some(mut local) = js_copy_bindings(bindings, budget, depth + 1)
+                            else {
+                                return;
+                            };
+                            if names.len() == 1 {
+                                js_bind(&mut local, names[0], value, budget);
+                            } else if let JsValue::Array(values) = value {
+                                for (name, value) in names.iter().zip(values) {
+                                    js_bind(&mut local, name, value, budget);
+                                }
+                            }
+                            js_patch_calls(
+                                program,
+                                scope.start + start..scope.start + finish,
+                                &mut local,
+                                patches,
+                                budget,
+                                depth + 1,
+                            );
+                            for (name, value) in bindings.iter_mut() {
+                                if !budget.step(name.len() + 1) {
+                                    return;
+                                }
+                                if !shadowed.contains(*name) {
+                                    if let Some(updated) = local.get(name) {
+                                        *value = js_copy(updated, budget, depth + 1);
+                                    }
+                                }
+                            }
+                            if budget.exhausted {
+                                return;
+                            }
+                        }
+                        i = finish + 1;
+                        continue;
+                    }
                 }
             }
         }
         if let (Some(JsToken::Word(name)), Some(JsToken::Punct('+')), Some(JsToken::Punct('='))) =
             (tokens.get(i), tokens.get(i + 1), tokens.get(i + 2))
         {
-            let end = js_end(tokens, i + 3, true);
-            let value = js_value(&tokens[i + 3..end], bindings);
-            if let (Some(JsValue::Text(left)), JsValue::Text(right)) =
-                (bindings.get_mut(name), value)
-            {
-                left.push_str(&right);
+            let end = program.end(&scope, i + 3, true);
+            let value = js_value(&tokens[i + 3..end], bindings, budget, depth + 1);
+            if !budget.step(name.len()) {
+                return;
+            }
+            if let Some(left) = bindings.get_mut(name) {
+                if let (JsValue::Text(text), JsValue::Text(right)) = (&mut *left, value) {
+                    if !budget.append(text, &right) {
+                        *left = js_unknown();
+                    }
+                }
             }
         }
         if let (Some(JsToken::Word(name)), Some(JsToken::Punct('='))) =
             (tokens.get(i), tokens.get(i + 1))
         {
             if tokens.get(i + 2) != Some(&JsToken::Punct('=')) {
-                let end = js_end(tokens, i + 2, true);
-                bindings.insert(name, js_value(&tokens[i + 2..end], bindings));
+                let end = program.end(&scope, i + 2, true);
+                let value = js_value(&tokens[i + 2..end], bindings, budget, depth + 1);
+                js_bind(bindings, name, value, budget);
             }
         }
         if tokens.get(i..i + 4)
@@ -392,14 +766,19 @@ fn js_patch_calls<'a>(
                 JsToken::Punct('('),
             ])
         {
-            let end = js_end(tokens, i + 4, true);
-            if let JsValue::Text(patch) = js_value(&tokens[i + 4..end], bindings) {
-                // Dynamic body expressions do not affect file headers. A dynamic
-                // header itself cannot identify a file, so do not invent a path.
+            let end = program.end(&scope, i + 4, true);
+            if let JsValue::Text(patch) = js_value(&tokens[i + 4..end], bindings, budget, depth + 1)
+            {
+                if !budget.step(patch.len()) {
+                    return;
+                }
                 if !patch
                     .lines()
                     .any(|line| line.starts_with("*** ") && line.contains('\0'))
                 {
+                    if !budget.allocate(std::mem::size_of::<String>()) {
+                        return;
+                    }
                     patches.push(patch);
                 }
             }
@@ -408,10 +787,23 @@ fn js_patch_calls<'a>(
     }
 }
 
-fn exec_patches(code: &str) -> Vec<String> {
+fn exec_patches_bounded(code: &str, budget: &mut JsBudget) -> Vec<String> {
     let mut patches = Vec::new();
-    js_patch_calls(&js_tokens(code), &mut JsBindings::new(), &mut patches);
+    if let Some(program) = JsProgram::new(code, budget) {
+        js_patch_calls(
+            &program,
+            0..program.tokens.len(),
+            &mut JsBindings::new(),
+            &mut patches,
+            budget,
+            0,
+        );
+    }
     patches
+}
+
+fn exec_patches(code: &str) -> Vec<String> {
+    exec_patches_bounded(code, &mut JsBudget::default())
 }
 
 fn field<'a>(value: Option<&'a Value>, names: &[&str]) -> Option<&'a str> {
@@ -805,5 +1197,135 @@ mod tests {
             found.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
             ["/home/alice/project/a.rs", "/home/alice/project/b.rs"]
         );
+    }
+    mod budget_cases {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/code_mode_budget/cases.rs"
+        ));
+    }
+
+    fn bounded_attack(name: &'static str) {
+        assert!(budget_cases::ATTACKS.contains(&name));
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let script = budget_cases::script(name);
+                let mut budget = JsBudget::default();
+                let patches = exec_patches_bounded(&script, &mut budget);
+                assert!(
+                    patches
+                        .iter()
+                        .any(|patch| patch.contains("/home/alice/before.rs")),
+                    "{name}"
+                );
+                assert!(budget.steps <= JS_MAX_STEPS, "{name}");
+                assert!(budget.iterations <= JS_MAX_ITERATIONS, "{name}");
+                assert!(budget.bytes <= JS_MAX_BYTES, "{name}");
+                assert!(budget.max_depth <= JS_MAX_DEPTH, "{name}");
+                if name == "assignment_chain" {
+                    assert!(budget.steps <= 20 * 50_000 + 1024, "{}", budget.steps);
+                } else if name != "missing_for_close" {
+                    assert!(budget.limited, "{name}");
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    macro_rules! budget_regressions {
+        ($($name:ident),+ $(,)?) => {$ (
+            #[test]
+            fn $name() { bounded_attack(stringify!($name)); }
+        )+};
+    }
+    budget_regressions!(
+        missing_for_close,
+        append_doubling,
+        expression_doubling,
+        array_doubling,
+        nested_loops,
+        arrays_20000,
+        arrays_5000,
+        arrays_200000,
+        objects_200000,
+        assignment_chain
+    );
+
+    #[test]
+    fn every_byte_truncation_of_code_mode_fixtures_is_safe() {
+        for script in [
+            include_str!("../../tests/fixtures/code_mode_budget/literals.js"),
+            include_str!("../../tests/fixtures/code_mode_budget/batches.js"),
+            include_str!("../../tests/fixtures/code_mode_budget/builder.js"),
+        ] {
+            assert!(!files(AgentId::Codex, "exec", json!(script)).is_empty());
+            for end in 0..=script.len() {
+                let prefix = String::from_utf8_lossy(&script.as_bytes()[..end]);
+                files(AgentId::Codex, "exec", json!(prefix));
+            }
+        }
+    }
+
+    #[test]
+    fn string_array_and_input_caps_are_enforced_without_erasing_prior_paths() {
+        let mut budget = JsBudget::default();
+        let mut text = String::new();
+        assert!(budget.append(&mut text, &"x".repeat(JS_MAX_STRING)));
+        assert!(!budget.append(&mut text, "x"));
+        assert_eq!(text.len(), JS_MAX_STRING);
+        assert!(budget.limited);
+
+        let code = format!("const a=[{}];", "'x',".repeat(JS_MAX_ITEMS + 1));
+        let mut budget = JsBudget::default();
+        exec_patches_bounded(&code, &mut budget);
+        assert!(budget.limited);
+
+        let mut code = budget_cases::script("missing_for_close");
+        code.push_str("/*");
+        code.push_str(&"x".repeat(JS_MAX_INPUT));
+        let mut budget = JsBudget::default();
+        let patches = exec_patches_bounded(&code, &mut budget);
+        assert!(budget.limited);
+        assert!(patches.iter().any(|p| p.contains("before.rs")));
+    }
+
+    #[test]
+    fn cached_expression_ends_match_linear_scans_for_all_fixture_prefixes() {
+        fn scan(tokens: &[JsToken<'_>], start: usize, statement: bool) -> usize {
+            let mut depth = 0;
+            for (i, t) in tokens.iter().enumerate().skip(start) {
+                match t {
+                    JsToken::Punct(')' | ']' | '}') if depth == 0 => return i,
+                    JsToken::Punct(',' | ';') if depth == 0 && statement => return i,
+                    JsToken::Punct('(' | '[' | '{') => depth += 1,
+                    JsToken::Punct(')' | ']' | '}') => depth -= 1,
+                    _ => {}
+                }
+            }
+            tokens.len()
+        }
+        for code in [
+            include_str!("../../tests/fixtures/code_mode_budget/batches.js"),
+            include_str!("../../tests/fixtures/code_mode_budget/builder.js"),
+        ] {
+            for end in code
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(code.len()))
+            {
+                let mut budget = JsBudget::default();
+                let program = JsProgram::new(&code[..end], &mut budget).unwrap();
+                for start in 0..=program.tokens.len() {
+                    for statement in [false, true] {
+                        assert_eq!(
+                            program.end(&(0..program.tokens.len()), start, statement),
+                            scan(&program.tokens, start, statement)
+                        );
+                    }
+                }
+            }
+        }
     }
 }
