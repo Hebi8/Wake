@@ -36,7 +36,12 @@ pub struct AntigravityAdapter {
 const DB_FILE: &str = "conversation_summaries.db";
 /// 写 `brain` 的 app 数据目录(`~/.gemini` 下):桌面端、IDE 与 CLI(索引库也在 CLI 目录里;
 /// 索引的 `app_data_dir` 列记的就是这几个名字)
-const APP_DIRS: [&str; 3] = ["antigravity", "antigravity-ide", "antigravity-cli"];
+const APP_DIRS: [&str; 4] = [
+    "antigravity",
+    "antigravity-ide",
+    "antigravity-cli",
+    "antigravity-acp",
+];
 /// 会话目录里转录的相对路径
 const TRANSCRIPT: [&str; 3] = [".system_generated", "logs", "transcript.jsonl"];
 const ENCRYPTED_NOTE: &str =
@@ -238,6 +243,14 @@ fn transcript(
     let project = row
         .map(|row| row.cwd.clone())
         .filter(|cwd| !cwd.is_empty())
+        .or_else(|| {
+            let meta = std::fs::read(transcript_meta_path(path)?).ok()?;
+            let meta: Value = serde_json::from_slice(&meta).ok()?;
+            meta.get("cwd")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(canonical_project_path)
+        })
         .or_else(|| t.workspace.as_deref().map(canonical_project_path))
         .unwrap_or_default();
     let app = row
@@ -256,6 +269,12 @@ fn transcript(
         created_at: if t.first_ts > 0 { t.first_ts } else { fallback },
         updated_at: if t.last_ts > 0 { t.last_ts } else { fallback },
         message_count: t.messages.len() as i64,
+        tokens_used: t
+            .messages
+            .iter()
+            .filter_map(|m| m.usage)
+            .map(TokenUsage::total)
+            .reduce(|a, b| a + b),
         model: t.model,
         source: surface(app),
         spawned: row.is_some_and(|row| row.parent.is_some()),
@@ -305,6 +324,19 @@ fn app_dir_of(transcript: &Path) -> Option<&str> {
         .to_str()
 }
 
+/// ACP stores cwd in the root object of conversations/<id>.meta, beside
+/// its database; the transcript lives separately under brain/<id>.
+fn transcript_meta_path(path: &Path) -> Option<PathBuf> {
+    let session = session_dir(path)?;
+    Some(
+        session
+            .parent()?
+            .parent()?
+            .join("conversations")
+            .join(format!("{}.meta", session.file_name()?.to_str()?)),
+    )
+}
+
 /// 转录的会话引用,列表与 watcher 同一个判据。索引里那一行也算进 mtime / size:它变了而
 /// 转录没动(在 app 里改了名、转录先于索引写出来)也会重解析
 fn transcript_ref(index: Option<&Index>, path: &Path) -> Option<SessionFileRef> {
@@ -315,6 +347,10 @@ fn transcript_ref(index: Option<&Index>, path: &Path) -> Option<SessionFileRef> 
     }
     let mut r = default_file_ref(AgentId::Antigravity, path)?;
     r.native_id = id.to_string();
+    if let Ok(meta) = std::fs::metadata(transcript_meta_path(path)?) {
+        r.mtime_ms = r.mtime_ms.max(mtime_ms(&meta));
+        r.size += meta.len() as i64;
+    }
     if let Some(row) = row {
         r.mtime_ms = r.mtime_ms.max(row.modified_ms);
         r.size += row.fingerprint();
@@ -396,6 +432,7 @@ struct Transcript {
 
 #[derive(Default)]
 struct Turn {
+    usage: Option<TokenUsage>,
     content: ParsedContent,
     thinking: Vec<String>,
     tool_calls: Vec<ToolCallView>,
@@ -406,12 +443,16 @@ struct Turn {
 impl Turn {
     fn flush(&mut self, messages: &mut Vec<TranscriptMessage>) {
         let turn = std::mem::take(self);
-        if turn.content.text.is_empty() && turn.thinking.is_empty() && turn.tool_calls.is_empty() {
+        if turn.content.text.is_empty()
+            && turn.thinking.is_empty()
+            && turn.tool_calls.is_empty()
+            && turn.usage.is_none()
+        {
             return;
         }
         let (text, truncated, full_text) = clip_message(&turn.content.text);
         messages.push(TranscriptMessage {
-            usage: None,
+            usage: turn.usage,
             seq: 0,
             role: Role::Assistant,
             kind: MessageKind::Text,
@@ -467,6 +508,17 @@ fn read_transcript(path: &Path, decode_images: bool) -> Result<Transcript> {
                 t.messages.push(message);
             }
             "PLANNER_RESPONSE" => {
+                // Planner steps are distinct calls. CHECKPOINT counters describe
+                // compaction state and must not be added to planner usage.
+                let usage = TokenUsage {
+                    input: row.get("input_tokens").and_then(Value::as_i64),
+                    output: row.get("output_tokens").and_then(Value::as_i64),
+                    cache_read: row.get("cache_read_tokens").and_then(Value::as_i64),
+                    cache_write: None,
+                };
+                if usage != TokenUsage::default() {
+                    turn.usage.get_or_insert_default().add(usage);
+                }
                 if turn.timestamp.is_none() && ts > 0 {
                     turn.timestamp = Some(ts);
                 }

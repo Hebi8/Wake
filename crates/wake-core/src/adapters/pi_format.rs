@@ -100,6 +100,17 @@ impl PiRender {
         {
             self.tokens_used = Some(self.tokens_used.unwrap_or(0).saturating_add(tokens));
         }
+        // pi-ai normalizes provider input to uncached tokens and keeps both
+        // cache buckets separate (api/openai-completions, anthropic-messages).
+        let usage = msg
+            .get("usage")
+            .map(|u| TokenUsage {
+                input: u.get("input").and_then(Value::as_i64),
+                output: u.get("output").and_then(Value::as_i64),
+                cache_read: u.get("cacheRead").and_then(Value::as_i64),
+                cache_write: u.get("cacheWrite").and_then(Value::as_i64),
+            })
+            .filter(|u| *u != TokenUsage::default());
         let parsed = content_parts(content, self.decode_images);
         let mut tools: Vec<ToolCallView> = Vec::new();
         let mut thinking = String::new();
@@ -129,6 +140,7 @@ impl PiRender {
             && tools.is_empty()
             && parsed.images.is_empty()
             && thinking.is_empty()
+            && usage.is_none()
         {
             return;
         }
@@ -139,6 +151,9 @@ impl PiRender {
         // 连续 assistant(中间只隔 toolResult)合并成一条,详情页每个回合一条助手消息
         let base = merge_into_last_assistant(&mut self.messages, ts, parsed, &thinking);
         let last = &mut self.messages[base];
+        if let Some(usage) = usage {
+            last.usage.get_or_insert_default().add(usage);
+        }
         if model.is_some() {
             last.model = model;
         }

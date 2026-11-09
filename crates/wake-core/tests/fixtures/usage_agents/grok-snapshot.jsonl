@@ -1,0 +1,2 @@
+{"timestamp":1767225600,"params":{"_meta":{"totalTokens":999999},"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"Alice asks."}}}}
+{"timestamp":1767225600,"params":{"_meta":{"totalTokens":999999},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Done."}}}}

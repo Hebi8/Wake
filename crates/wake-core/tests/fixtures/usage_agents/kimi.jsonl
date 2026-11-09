@@ -1,0 +1,14 @@
+{"type":"context.append_loop_event","time":1767225600000,"event":{"type":"content.part","part":{"type":"text","text":"Inherited."}}}
+{"type":"usage.record","time":1767225600001,"model":"synthetic-model","usage":{"input":900,"output":100}}
+{"type":"forked"}
+{"type":"context.append_loop_event","time":1767225600000,"event":{"type":"content.part","part":{"type":"text","text":"Checking."}}}
+{"type":"context.append_loop_event","event":{"type":"tool.call","toolCallId":"alice-call","name":"read_file","args":{"path":"/home/alice/project/file.txt"}}}
+{"type":"usage.record","time":1767225600001,"model":"synthetic-model","usage":{"input":10,"output":2}}
+{"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"alice-call","result":{"output":"Synthetic contents.","isError":false}}}
+{"type":"usage.record","time":1767225600001,"model":"synthetic-model","usage":{"input":4,"output":1}}
+{"type":"turn.end"}
+{"type":"turn.begin"}
+{"type":"usage.record","time":1767225600001,"model":"synthetic-model","usage":{"output":0}}
+{"type":"turn.end"}
+{"type":"context.append_loop_event","time":1767225600000,"event":{"type":"content.part","part":{"type":"text","text":"Current schema."}}}
+{"type":"usage.record","time":1767225600001,"model":"synthetic-model","usage":{"inputOther":3,"output":1,"inputCacheRead":8,"inputCacheCreation":2}}

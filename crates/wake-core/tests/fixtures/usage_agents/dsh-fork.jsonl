@@ -1,0 +1,4 @@
+{"type":"session","version":4,"id":"alice-dsh","cwd":"/home/alice/project","createdAt":1767225600000,"isSeeded":true,"parentSession":"alice-parent"}
+{"type":"assistant/message","seq":1,"time":1767225600001,"data":{"message":{"content":[{"type":"text","text":"Inherited."}],"source":{"model":"synthetic-model"}},"usage":{"inputTokens":900,"outputTokens":100}}}
+{"type":"session/end-seed","seq":2,"data":{"inherited":true}}
+{"type":"assistant/message","seq":3,"time":1767225600003,"data":{"message":{"content":[],"source":{"model":"synthetic-model"}},"usage":{"inputTokens":4,"outputTokens":2}}}

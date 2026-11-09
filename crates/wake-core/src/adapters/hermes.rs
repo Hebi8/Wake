@@ -266,6 +266,10 @@ impl HermesAdapter {
                                 .or_else(|| pending.iter().copied().find(unfilled))
                         });
                     if let Some((mi, ti)) = slot {
+                        messages[mi].tool_calls[ti].is_error = structured_tool_error(
+                            &messages[mi].tool_calls[ti].name,
+                            m.content.as_deref(),
+                        );
                         messages[mi].tool_calls[ti].output = Some(clip(&output, MAX_TOOL_IO).0);
                         pending.retain(|s| *s != (mi, ti));
                     }
@@ -385,6 +389,37 @@ fn query_rows(ro: &SqliteRo, db: &HermesDb) -> Option<Vec<HermesRow>> {
         .collect::<rusqlite::Result<Vec<_>>>()
         .ok();
     rows
+}
+
+/// Only top-level structured signals are evidence of failure. Text mentioning
+/// errors and nested payloads may be ordinary data returned by a successful tool.
+fn structured_tool_error(name: &str, content: Option<&str>) -> bool {
+    let Some(Value::Object(data)) = content.and_then(|s| serde_json::from_str(s).ok()) else {
+        return false;
+    };
+    let error = data.get("error").is_some_and(|v| match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+        Value::Number(n) => n.as_f64().is_some_and(|n| n != 0.0),
+    });
+    // Hermes excludes explicit guardrail refusals and proven landed writes
+    // from failures (agent/tool_result_classification.py).
+    if data.get("guardrail_refusal").and_then(Value::as_bool) == Some(true)
+        || (!error
+            && ((name == "write_file" && data.contains_key("bytes_written"))
+                || (name == "patch" && data.get("success").and_then(Value::as_bool) == Some(true))))
+    {
+        return false;
+    }
+    error
+        || data.get("success").and_then(Value::as_bool) == Some(false)
+        || data
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .is_some_and(|n| n != 0)
 }
 
 /// content 列多为纯文本;多模态时写端存 JSON 块数组字符串,识别后走

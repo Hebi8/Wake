@@ -373,7 +373,6 @@ const KNOWN_RECORDS: &[&str] = &[
     "tools.set_active_tools",
     "tools.unregister_user_tool",
     "tools.update_store",
-    "usage.record",
 ];
 
 /// 这条用户输入是不是用户自己给的,照抄 Kimi 的 `isUserVisibleTurnInputRecord`:user;用户敲
@@ -449,6 +448,29 @@ impl WireReader {
                     Some("assistant" | "tool") => self.context_message(message, ts),
                     Some("user" | "notify") => {}
                     _ => self.unknown += 1,
+                }
+            }
+            "usage.record" => {
+                // UsageRecorder writes each step's increment, then adds it to
+                // the session accumulator. It is not a cumulative snapshot.
+                let usage = row
+                    .get("usage")
+                    .map(|u| TokenUsage {
+                        // The fixture-era input/output shape and current kosong
+                        // inputOther/inputCacheRead/inputCacheCreation are explicit
+                        // source schemas; the latter's input excludes both caches.
+                        input: u
+                            .get("inputOther")
+                            .or_else(|| u.get("input"))
+                            .and_then(Value::as_i64),
+                        output: u.get("output").and_then(Value::as_i64),
+                        cache_read: u.get("inputCacheRead").and_then(Value::as_i64),
+                        cache_write: u.get("inputCacheCreation").and_then(Value::as_i64),
+                    })
+                    .filter(|u| *u != TokenUsage::default());
+                if let Some(usage) = usage {
+                    let ix = self.reply(ts);
+                    self.messages[ix].usage.get_or_insert_default().add(usage);
                 }
             }
             "context.apply_compaction" => {
@@ -724,7 +746,11 @@ fn build_meta(
         size_bytes: r.size,
         git_branch: None,
         model: None,
-        tokens_used: None,
+        tokens_used: messages
+            .iter()
+            .filter_map(|m| m.usage)
+            .map(TokenUsage::total)
+            .reduce(|a, b| a + b),
         archived: state.archived,
         source: None,
         spawned: false,

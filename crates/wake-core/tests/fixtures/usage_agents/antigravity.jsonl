@@ -1,0 +1,7 @@
+{"type":"USER_INPUT","created_at":"2026-01-01T00:00:00Z","content":"<USER_REQUEST>Alice asks for a check.</USER_REQUEST>"}
+{"type":"PLANNER_RESPONSE","step_index":1,"content":"Checking.","input_tokens":10,"output_tokens":3,"cache_read_tokens":40}
+{"type":"PLANNER_RESPONSE","step_index":2,"input_tokens":2,"output_tokens":1}
+{"type":"CHECKPOINT","content":"Synthetic summary.","input_tokens":500,"output_tokens":60,"cache_read_tokens":400}
+{"type":"PLANNER_RESPONSE","step_index":4,"output_tokens":0}
+{"type":"USER_INPUT","content":"Alice asks again."}
+{"type":"PLANNER_RESPONSE","step_index":6,"content":"Done."}

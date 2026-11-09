@@ -1,0 +1,7 @@
+{"type":"session","version":3,"id":"alice-pi","cwd":"/home/alice/project","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"message","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[],"usage":{"input":10,"output":2,"cacheRead":30,"cacheWrite":5,"totalTokens":47}}}
+{"type":"message","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"Checked."}],"usage":{"input":4,"output":1,"totalTokens":5}}}
+{"type":"message","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"text","text":"Alice asks again."}]}}
+{"type":"message","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[],"usage":{"output":0,"totalTokens":0}}}
+{"type":"message","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"text","text":"Alice asks without counters."}]}}
+{"type":"message","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}

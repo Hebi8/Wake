@@ -486,27 +486,25 @@ fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
                 if model.is_some() {
                     p.model = model.clone();
                 }
-                if let Some(u) = data.get("usage") {
-                    // TokenUsage 是"one model call"的账、三项 input 互斥(billed =
-                    // 三项之和),所以**按调用累加**,不能 last-wins:一个 turn 多个
-                    // step,last-wins 只会剩最后一次调用的量
-                    let sum = [
-                        "inputTokens",
-                        "outputTokens",
-                        "cacheReadTokens",
-                        "cacheWriteTokens",
-                    ]
-                    .iter()
-                    .filter_map(|k| u.get(*k).and_then(|v| v.as_i64()))
-                    .sum::<i64>();
-                    if sum > 0 {
-                        p.tokens_used = Some(p.tokens_used.unwrap_or(0) + sum);
-                    }
+                // One assistant/message is one model call; input and the two
+                // cache buckets are disjoint in dsh-session's TokenUsage.
+                let usage = data
+                    .get("usage")
+                    .map(|u| TokenUsage {
+                        input: u.get("inputTokens").and_then(|v| v.as_i64()),
+                        output: u.get("outputTokens").and_then(|v| v.as_i64()),
+                        cache_read: u.get("cacheReadTokens").and_then(|v| v.as_i64()),
+                        cache_write: u.get("cacheWriteTokens").and_then(|v| v.as_i64()),
+                    })
+                    .filter(|u| *u != TokenUsage::default());
+                if let Some(usage) = usage {
+                    p.tokens_used = Some(p.tokens_used.unwrap_or(0) + usage.total());
                 }
                 if parsed_message.text.is_empty()
                     && tools.is_empty()
                     && thinking_parts.is_empty()
                     && parsed_message.images.is_empty()
+                    && usage.is_none()
                 {
                     continue;
                 }
@@ -523,6 +521,9 @@ fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
                     &thinking_parts.join("\n\n"),
                 );
                 let last = &mut p.messages[base];
+                if let Some(usage) = usage {
+                    last.usage.get_or_insert_default().add(usage);
+                }
                 if model.is_some() {
                     last.model = model;
                 }

@@ -146,6 +146,11 @@ struct Replay {
     cur_tools: Vec<ToolCallView>,
     cur_images: Vec<ImageAttachment>,
     cur_ts: i64,
+    // PromptUsage is a snapshot of one completed prompt, potentially containing
+    // many model calls (and completed subagents), not an individual API call.
+    cur_usage: Option<TokenUsage>,
+    cur_tokens: Option<i64>,
+    tokens_used: Option<i64>,
 }
 
 impl Replay {
@@ -159,6 +164,9 @@ impl Replay {
             cur_tools: Vec::new(),
             cur_images: Vec::new(),
             cur_ts: 0,
+            cur_usage: None,
+            cur_tokens: None,
+            tokens_used: None,
         }
     }
 
@@ -166,6 +174,10 @@ impl Replay {
         let Some(role) = self.cur_role.take() else {
             return;
         };
+        let usage = self.cur_usage.take();
+        if let Some(tokens) = self.cur_tokens.take() {
+            self.tokens_used = Some(self.tokens_used.unwrap_or(0) + tokens);
+        }
         let text = std::mem::take(&mut self.cur_text);
         let thinking = std::mem::take(&mut self.cur_thinking);
         let tools = std::mem::take(&mut self.cur_tools);
@@ -174,6 +186,7 @@ impl Replay {
             && thinking.trim().is_empty()
             && tools.is_empty()
             && images.is_empty()
+            && usage.is_none()
         {
             return;
         }
@@ -182,6 +195,7 @@ impl Replay {
             m.thinking = Some(clip(thinking.trim(), MAX_TOOL_IO).0);
         }
         m.images = images;
+        m.usage = usage;
         let base = self.messages.len();
         for (ix, tc) in tools.into_iter().enumerate() {
             self.tool_index.insert(tc.id.clone(), (base, ix));
@@ -249,7 +263,7 @@ fn apply_tool_update(
         if let Some(raw) = update.get("rawInput").filter(|r| !r.is_null()) {
             tc.input_preview = make_preview(raw);
             if let Ok(json) = serde_json::to_string_pretty(raw) {
-                tc.input = Some(clip(&json, MAX_TOOL_IO).0);
+                tc.input = Some(json);
             }
         }
     }
@@ -266,6 +280,7 @@ enum UpdateKind {
     ToolCall,
     /// 只回填已有的调用,自己不起消息
     ToolCallUpdate,
+    TurnCompleted,
     /// 已知的非内容更新:任务后台化 / 压缩等
     Known,
     Unknown,
@@ -279,6 +294,23 @@ impl UpdateKind {
             Some("agent_thought_chunk") => Self::Thought,
             Some("tool_call") => Self::ToolCall,
             Some("tool_call_update") => Self::ToolCallUpdate,
+            Some("turn_completed") => {
+                if update.get("usage").is_some_and(|u| {
+                    [
+                        "inputTokens",
+                        "outputTokens",
+                        "cachedReadTokens",
+                        "cacheCreationTokens",
+                        "totalTokens",
+                    ]
+                    .iter()
+                    .any(|key| u.get(*key).and_then(Value::as_i64).is_some())
+                }) {
+                    Self::TurnCompleted
+                } else {
+                    Self::Known
+                }
+            }
             Some(
                 "task_backgrounded"
                 | "task_completed"
@@ -294,7 +326,7 @@ impl UpdateKind {
 
     fn opens_message(self) -> bool {
         match self {
-            Self::Chunk(_) | Self::Thought | Self::ToolCall => true,
+            Self::Chunk(_) | Self::Thought | Self::ToolCall | Self::TurnCompleted => true,
             Self::ToolCallUpdate | Self::Known | Self::Unknown => false,
         }
     }
@@ -320,7 +352,10 @@ fn is_empty_shell(path: &Path) -> bool {
     true
 }
 
-fn parse_grok_updates(path: &Path, decode_images: bool) -> Result<(Vec<TranscriptMessage>, u32)> {
+fn parse_grok_updates(
+    path: &Path,
+    decode_images: bool,
+) -> Result<(Vec<TranscriptMessage>, u32, Option<i64>)> {
     let _image_budget = transcript_image_decode_budget(decode_images);
     let file = fs::File::open(path)?;
     let reader = BufReader::with_capacity(1 << 20, file);
@@ -379,6 +414,35 @@ fn parse_grok_updates(path: &Path, decode_images: bool) -> Result<(Vec<Transcrip
                     append_images_to_message_end(message, images);
                 }
             }
+            UpdateKind::TurnCompleted => {
+                if let Some(u) = update.get("usage") {
+                    rp.ensure(Role::Assistant, ts);
+                    // Bundled Grok headless guide: ACP PromptUsage.inputTokens
+                    // includes both cache buckets. Only normalize when the split
+                    // is known; absent counters must not be invented as zero.
+                    let read = u.get("cachedReadTokens").and_then(Value::as_i64);
+                    let write = u.get("cacheCreationTokens").and_then(Value::as_i64);
+                    let input = u
+                        .get("inputTokens")
+                        .and_then(Value::as_i64)
+                        .zip(read)
+                        .zip(write)
+                        .and_then(|((input, read), write)| {
+                            input.checked_sub(read)?.checked_sub(write)
+                        })
+                        .filter(|input| *input >= 0);
+                    let usage = TokenUsage {
+                        input,
+                        output: u.get("outputTokens").and_then(Value::as_i64),
+                        cache_read: read,
+                        cache_write: write,
+                    };
+                    // Replace repeated completion snapshots within this prompt.
+                    // params._meta.totalTokens is not an increment and is ignored.
+                    rp.cur_usage = (usage != TokenUsage::default()).then_some(usage);
+                    rp.cur_tokens = u.get("totalTokens").and_then(Value::as_i64);
+                }
+            }
             UpdateKind::Known => {}
             UpdateKind::Unknown => {
                 unknown += 1;
@@ -388,7 +452,7 @@ fn parse_grok_updates(path: &Path, decode_images: bool) -> Result<(Vec<Transcrip
     rp.flush();
     let mut messages = rp.messages;
     assign_seq(&mut messages);
-    Ok((messages, unknown))
+    Ok((messages, unknown, rp.tokens_used))
 }
 
 fn build_meta(
@@ -513,17 +577,20 @@ impl AgentAdapter for GrokAdapter {
     }
 
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
-        let (messages, unknown) = parse_grok_updates(Path::new(&r.file_path), false)?;
+        let (messages, unknown, tokens) = parse_grok_updates(Path::new(&r.file_path), false)?;
         let side = read_summary(Path::new(&r.file_path));
-        let meta = build_meta(r, &side, &messages, &self.grok_home, &self.group_ctx());
+        let mut meta = build_meta(r, &side, &messages, &self.grok_home, &self.group_ctx());
+        meta.tokens_used = tokens;
         Ok(ParsedSession::derive(meta, &messages, unknown))
     }
 
     fn parse_transcript(&self, r: &SessionFileRef) -> Result<ParsedTranscript> {
-        let (messages, unknown) = parse_grok_updates(Path::new(&r.file_path), true)?;
+        let (messages, unknown, tokens) = parse_grok_updates(Path::new(&r.file_path), true)?;
         let side = read_summary(Path::new(&r.file_path));
+        let mut meta = build_meta(r, &side, &messages, &self.grok_home, &self.group_ctx());
+        meta.tokens_used = tokens;
         Ok(ParsedTranscript {
-            meta: build_meta(r, &side, &messages, &self.grok_home, &self.group_ctx()),
+            meta,
             mainline: messages,
             sidechains: Vec::new(),
             unknown_line_count: unknown,
