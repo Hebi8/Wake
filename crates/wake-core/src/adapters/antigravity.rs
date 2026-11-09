@@ -411,6 +411,7 @@ impl Turn {
         }
         let (text, truncated, full_text) = clip_message(&turn.content.text);
         messages.push(TranscriptMessage {
+            usage: None,
             seq: 0,
             role: Role::Assistant,
             kind: MessageKind::Text,

@@ -1522,6 +1522,7 @@ mod tests {
 
     fn msg(seq: i64, text: &str, tools: &[(&str, &str)]) -> TranscriptMessage {
         TranscriptMessage {
+            usage: None,
             seq,
             role: Role::Assistant,
             kind: MessageKind::Text,

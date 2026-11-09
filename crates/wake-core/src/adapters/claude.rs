@@ -605,6 +605,7 @@ fn flush_assistant(
         }
     }
     messages.push(TranscriptMessage {
+        usage: None,
         seq: 0,
         role: Role::Assistant,
         kind: MessageKind::Text,
@@ -736,6 +737,7 @@ fn parse_claude_jsonl(
                 if !content.is_empty() {
                     let (text, truncated) = clip(content, MAX_TOOL_IO);
                     messages.push(TranscriptMessage {
+                        usage: None,
                         seq: 0,
                         role: Role::System,
                         kind: MessageKind::Meta,
@@ -820,6 +822,7 @@ fn parse_claude_jsonl(
             }
             let (clipped, truncated, full_text) = clip_message(&text);
             messages.push(TranscriptMessage {
+                usage: None,
                 seq: 0,
                 role: Role::User,
                 kind,
@@ -966,6 +969,7 @@ fn ts_opt(ts: i64) -> Option<i64> {
 
 fn mk_msg(role: Role, kind: MessageKind, text: &str, ts: i64) -> TranscriptMessage {
     TranscriptMessage {
+        usage: None,
         seq: 0,
         role,
         kind,

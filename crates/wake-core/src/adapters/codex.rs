@@ -1023,6 +1023,7 @@ fn clean_user_text(text: &str) -> String {
 fn mk_msg(role: Role, kind: MessageKind, text: &str, ts: i64) -> TranscriptMessage {
     let (clipped, truncated, full_text) = clip_message(text);
     TranscriptMessage {
+        usage: None,
         seq: 0,
         role,
         kind,

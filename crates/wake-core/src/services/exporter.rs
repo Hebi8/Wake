@@ -425,6 +425,7 @@ mod compact_tests {
 
     fn msg(seq: i64, role: Role, kind: MessageKind, text: &str) -> TranscriptMessage {
         TranscriptMessage {
+            usage: None,
             seq,
             role,
             kind,

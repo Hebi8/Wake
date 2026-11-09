@@ -847,6 +847,7 @@ impl LegacyParse {
             }
         }
         self.messages.push(TranscriptMessage {
+            usage: None,
             seq: 0,
             role: Role::Assistant,
             kind: MessageKind::Text,

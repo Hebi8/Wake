@@ -210,6 +210,7 @@ pub fn text_msg(role: Role, text: &str, ts: i64) -> TranscriptMessage {
         MessageKind::Text
     };
     TranscriptMessage {
+        usage: None,
         seq: 0,
         role,
         kind,

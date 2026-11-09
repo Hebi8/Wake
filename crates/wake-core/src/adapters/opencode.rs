@@ -724,6 +724,7 @@ impl BlockAcc {
         }
         let (clipped, truncated, full_text) = clip_message(&text);
         Some(TranscriptMessage {
+            usage: None,
             seq: 0,
             role,
             kind,

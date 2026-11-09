@@ -115,6 +115,7 @@ fn flush_assistant(
         }
     }
     messages.push(TranscriptMessage {
+        usage: None,
         seq: 0,
         role: Role::Assistant,
         kind: MessageKind::Text,
@@ -374,6 +375,7 @@ fn parse_qoder_jsonl(path: &Path, decode_images: bool) -> Result<QoderParse> {
             flush_assistant(&mut pending, &mut messages, &mut tool_index);
             if row.get("subtype").and_then(Value::as_str) == Some("compact_boundary") {
                 messages.push(TranscriptMessage {
+                    usage: None,
                     seq: 0,
                     role: Role::System,
                     kind: MessageKind::CompactSummary,
@@ -465,6 +467,7 @@ fn parse_qoder_jsonl(path: &Path, decode_images: bool) -> Result<QoderParse> {
             };
             let (text, truncated, full_text) = clip_message(&text);
             messages.push(TranscriptMessage {
+                usage: None,
                 seq: 0,
                 role: Role::User,
                 kind,

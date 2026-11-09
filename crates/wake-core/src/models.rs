@@ -367,9 +367,43 @@ pub struct ImageAttachment {
     pub text_offset: usize,
 }
 
+/// Token components reported by the source. Cache tokens remain separate from input.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input: Option<i64>,
+    pub output: Option<i64>,
+    pub cache_read: Option<i64>,
+    pub cache_write: Option<i64>,
+}
+
+impl TokenUsage {
+    /// Combine distinct calls merged into one display message, preserving unknown fields.
+    pub fn add(&mut self, other: Self) {
+        for (left, right) in [
+            (&mut self.input, other.input),
+            (&mut self.output, other.output),
+            (&mut self.cache_read, other.cache_read),
+            (&mut self.cache_write, other.cache_write),
+        ] {
+            if let Some(value) = right {
+                *left = Some(left.unwrap_or(0) + value);
+            }
+        }
+    }
+
+    pub fn total(self) -> i64 {
+        [self.input, self.output, self.cache_read, self.cache_write]
+            .into_iter()
+            .flatten()
+            .sum()
+    }
+}
+
 /// 详情页统一消息模型
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
     /// 会话内稳定序号(搜索定位锚点)
     pub seq: i64,
     pub role: Role,

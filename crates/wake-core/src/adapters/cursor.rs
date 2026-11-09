@@ -228,6 +228,7 @@ fn flush_assistant(pending: &mut Option<PendingAssistant>, messages: &mut Vec<Tr
     }
     let (clipped, truncated, full_text) = clip_message(&text);
     messages.push(TranscriptMessage {
+        usage: None,
         seq: 0,
         role: Role::Assistant,
         kind: MessageKind::Text,
