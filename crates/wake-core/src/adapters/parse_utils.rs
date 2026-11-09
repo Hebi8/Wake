@@ -1303,7 +1303,7 @@ pub fn tool_call_view(
         input: if input_json.is_empty() {
             None
         } else {
-            Some(clip(&input_json, MAX_TOOL_IO).0)
+            Some(input_json)
         },
         output: output.map(|o| clip(&o, MAX_TOOL_IO).0),
         is_error,

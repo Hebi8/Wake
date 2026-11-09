@@ -519,9 +519,18 @@ pub struct ParsedSession {
 pub struct MessageStructure {
     pub seq: i64,
     pub tool_calls: Vec<ToolCallView>,
+    pub tool_files: Vec<ToolFile>,
+    pub usage: Option<TokenUsage>,
     pub thinking: Option<String>,
     pub model: Option<String>,
     pub full_text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolFile {
+    pub idx: usize,
+    pub path: String,
+    pub op: &'static str,
 }
 
 #[derive(Debug, Clone, Default)]

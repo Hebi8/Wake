@@ -29,6 +29,7 @@ pub(crate) mod grok_group;
 pub(crate) mod parse_utils;
 pub(crate) mod pi_format;
 pub(crate) mod sqlite_ro;
+mod tool_files;
 
 /// `<文件>#<id>` 虚拟路径拆成两半(不看磁盘)
 pub use sqlite_ro::split_virtual_path;
@@ -678,7 +679,7 @@ fn units_from_messages(messages: &[TranscriptMessage]) -> Vec<IndexUnit> {
                 parts.push(format!("{} {}", tc.name, tc.input_preview));
             }
             let text = parse_utils::clip(&parts.join("\n"), MAX_MSG_TEXT).0;
-            if text.trim().is_empty() {
+            if text.trim().is_empty() && m.usage.is_none() {
                 None
             } else {
                 Some(IndexUnit {
@@ -748,12 +749,31 @@ impl ParsedSession {
         let structure = messages
             .iter()
             .filter(|m| m.kind == MessageKind::Text && indexed.contains(&m.seq))
-            .map(|m| MessageStructure {
-                seq: m.seq,
-                tool_calls: m.tool_calls.clone(),
-                thinking: m.thinking.clone(),
-                model: m.model.clone(),
-                full_text: m.full_text.clone(),
+            .map(|m| {
+                let tool_files = m
+                    .tool_calls
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(idx, call)| {
+                        tool_files::from_call(meta.agent, call, idx, &meta.project_path)
+                    })
+                    .collect();
+                let mut tool_calls = m.tool_calls.clone();
+                for call in &mut tool_calls {
+                    call.input = call
+                        .input
+                        .as_deref()
+                        .map(|input| parse_utils::clip(input, MAX_TOOL_IO).0);
+                }
+                MessageStructure {
+                    seq: m.seq,
+                    tool_calls,
+                    tool_files,
+                    usage: m.usage,
+                    thinking: m.thinking.clone(),
+                    model: m.model.clone(),
+                    full_text: m.full_text.clone(),
+                }
             })
             .collect();
         Self {
@@ -1701,5 +1721,18 @@ mod tests {
             ),
             "command 里没有整词就不算,哪怕 description 提到"
         );
+    }
+    #[test]
+    fn usage_only_messages_keep_an_index_row() {
+        let mut message = msg(7, "", &[]);
+        assert!(units_from_messages(&[message.clone()]).is_empty());
+        message.usage = Some(TokenUsage {
+            input: Some(5),
+            ..Default::default()
+        });
+        let units = units_from_messages(&[message]);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].seq, 7);
+        assert!(units[0].text.is_empty());
     }
 }

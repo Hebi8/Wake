@@ -93,8 +93,21 @@ CREATE TABLE IF NOT EXISTS message_extras (
   thinking TEXT,
   model TEXT,
   full_text TEXT,
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  cache_read_tokens INTEGER,
+  cache_write_tokens INTEGER,
   PRIMARY KEY (session_key, seq)
 );
+CREATE TABLE IF NOT EXISTS tool_files (
+  session_key TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  idx INTEGER NOT NULL,
+  path TEXT NOT NULL,
+  op TEXT NOT NULL,
+  PRIMARY KEY (session_key, seq, idx, path, op)
+);
+CREATE INDEX IF NOT EXISTS idx_tool_files_path ON tool_files(path);
 CREATE TABLE IF NOT EXISTS structure_sessions (
   session_key TEXT PRIMARY KEY,
   file_mtime INTEGER NOT NULL,
@@ -297,7 +310,7 @@ CREATE TABLE IF NOT EXISTS claimed_sessions (
 pub const FTS_FORMAT: &str = "19";
 
 /// Side-table schema and derivation version; independent of search formatting.
-pub const STRUCTURE_FORMAT: &str = "1";
+pub const STRUCTURE_FORMAT: &str = "2";
 
 /// 正文里中日韩字符的两字组索引(issue #79):trigram 对两个字的词 MATCH 不出东西,而中文最常搜的
 /// 恰恰是两字词。只收有两个以上相连中日韩字符的行,文本是 `cjk_bigrams` 切好、空格隔开的两字组,
@@ -391,6 +404,19 @@ fn open_conn(path: &Path) -> Result<Connection> {
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('fts_format', ?1)",
             params![FTS_FORMAT],
         )?;
+    }
+    for column in [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+    ] {
+        if !table_has_column(&conn, "message_extras", column)? {
+            conn.execute(
+                &format!("ALTER TABLE message_extras ADD COLUMN {column} INTEGER"),
+                [],
+            )?;
+        }
     }
     if read_meta(&conn, "structure_format")?.as_deref() != Some(STRUCTURE_FORMAT) {
         let tx = conn.transaction()?;
@@ -1913,7 +1939,7 @@ impl Store {
              INSERT INTO messages_cjk(messages_cjk) VALUES ('delete-all');
              DELETE FROM schema_meta WHERE key = 'cjk_backfill';
              DELETE FROM memories; DELETE FROM memories_fts; DELETE FROM wake_lookups;
-             DELETE FROM tool_calls; DELETE FROM message_extras; DELETE FROM structure_sessions;
+             DELETE FROM tool_files; DELETE FROM tool_calls; DELETE FROM message_extras; DELETE FROM structure_sessions;
              DELETE FROM structure_failures;
              DELETE FROM sessions;",
         )?;
@@ -3828,6 +3854,7 @@ fn write_session_tx(
 
 fn clear_structure(tx: &rusqlite::Transaction<'_>, key: &str) -> Result<()> {
     for table in [
+        "tool_files",
         "tool_calls",
         "message_extras",
         "structure_sessions",
@@ -3851,9 +3878,13 @@ fn replace_structure(
         "INSERT INTO tool_calls(session_key, seq, idx, call_id, name, input, output, is_error, child_id)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
     )?;
+    let mut file = tx.prepare_cached(
+        "INSERT INTO tool_files(session_key, seq, idx, path, op) VALUES (?1,?2,?3,?4,?5)",
+    )?;
     let mut extra = tx.prepare_cached(
-        "INSERT INTO message_extras(session_key, seq, kind, thinking, model, full_text)
-         VALUES (?1,?2,'text',?3,?4,?5)",
+        "INSERT INTO message_extras(session_key, seq, kind, thinking, model, full_text,
+          input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
+         VALUES (?1,?2,'text',?3,?4,?5,?6,?7,?8,?9)",
     )?;
     for m in structure {
         for (idx, tc) in m.tool_calls.iter().enumerate() {
@@ -3869,8 +3900,22 @@ fn replace_structure(
                 tc.child_id
             ])?;
         }
-        if m.thinking.is_some() || m.model.is_some() || m.full_text.is_some() {
-            extra.execute(params![meta.key, m.seq, m.thinking, m.model, m.full_text])?;
+        for f in &m.tool_files {
+            file.execute(params![meta.key, m.seq, f.idx as i64, f.path, f.op])?;
+        }
+        if m.thinking.is_some() || m.model.is_some() || m.full_text.is_some() || m.usage.is_some() {
+            let usage = m.usage.unwrap_or_default();
+            extra.execute(params![
+                meta.key,
+                m.seq,
+                m.thinking,
+                m.model,
+                m.full_text,
+                usage.input,
+                usage.output,
+                usage.cache_read,
+                usage.cache_write
+            ])?;
         }
     }
     tx.execute(

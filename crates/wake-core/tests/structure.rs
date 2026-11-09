@@ -193,7 +193,12 @@ fn failed_side_write_rolls_back_messages_and_stamp() {
     assert!(full.ends_with("before"));
     conn.execute_batch("DROP TRIGGER fail_extra").unwrap();
     store.remove_session(&before.meta.key).unwrap();
-    for table in ["tool_calls", "message_extras", "structure_sessions"] {
+    for table in [
+        "tool_files",
+        "tool_calls",
+        "message_extras",
+        "structure_sessions",
+    ] {
         let count: i64 = conn
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
             .unwrap();
@@ -229,4 +234,70 @@ fn structure_upgrade_is_independent_of_fts_and_survives_reopen() {
         )
         .unwrap();
     assert_eq!(version, STRUCTURE_FORMAT);
+}
+
+#[test]
+fn file_rows_and_usage_share_the_session_transaction_and_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("test.db");
+    let store = Store::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let (mut parsed, _) = parse(dir.path(), "body", 1);
+    // A usage-only extra has no model, thinking or full text.
+    parsed.structure[0].usage = Some(TokenUsage {
+        input: Some(12),
+        output: Some(3),
+        cache_read: None,
+        cache_write: Some(0),
+    });
+    parsed.structure[1].tool_files.push(ToolFile {
+        idx: 0,
+        path: "/home/alice/project/edit.rs".into(),
+        op: "change",
+    });
+    write(&store, &parsed, 1).unwrap();
+    let usage: (String, Option<i64>, Option<i64>, Option<i64>, Option<i64>) = conn.query_row(
+        "SELECT kind,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens FROM message_extras WHERE seq=0",
+        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    ).unwrap();
+    assert_eq!(usage, ("text".into(), Some(12), Some(3), None, Some(0)));
+    conn.execute_batch("CREATE TRIGGER fail_file BEFORE INSERT ON tool_files BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;").unwrap();
+    let old_rows = rows(&conn);
+    parsed.units[0].text = "replacement".into();
+    parsed.structure[1].tool_files[0].path = "/home/alice/project/new.rs".into();
+    assert!(write(&store, &parsed, 2).is_err());
+    assert_eq!(rows(&conn), old_rows);
+    let path: String = conn
+        .query_row("SELECT path FROM tool_files", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(path, "/home/alice/project/edit.rs");
+    conn.execute_batch("DROP TRIGGER fail_file").unwrap();
+    parsed.structure[1].tool_files.clear();
+    write(&store, &parsed, 2).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM tool_files", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    parsed.structure[1].tool_files.push(ToolFile {
+        idx: 0,
+        path: "/home/alice/file.rs".into(),
+        op: "read",
+    });
+    write(&store, &parsed, 3).unwrap();
+    store.remove_session(&parsed.meta.key).unwrap();
+    for table in [
+        "tool_files",
+        "tool_calls",
+        "message_extras",
+        "structure_sessions",
+    ] {
+        assert_eq!(
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
 }
